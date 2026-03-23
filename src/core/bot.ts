@@ -897,6 +897,20 @@ export class LettaBot implements AgentSession {
         lines.push('', 'Use `/model <handle>` to switch.');
         return lines.join('\n');
       }
+      case 'models': {
+        const { listModels } = await import('../tools/letta-api.js');
+        const allModels = await listModels();
+        if (allModels.length === 0) {
+          return 'No models available. Check your Letta server configuration.';
+        }
+        const lines = ['All available models:', ''];
+        for (const m of allModels) {
+          const displayName = m.display_name || m.name;
+          lines.push(`  ${displayName} - \`${m.handle}\``);
+        }
+        lines.push('', `Total: ${allModels.length} models`);
+        return lines.join('\n');
+      }
       default:
         return null;
     }
