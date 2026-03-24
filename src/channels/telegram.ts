@@ -34,6 +34,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   'reset',
   'cancel',
   'setconv',
+  'models',
   'break_glass',
   'help',
   'start',
@@ -331,6 +332,22 @@ export class TelegramAdapter implements ChannelAdapter {
         await this.sendMessage({
           chatId: String(ctx.chat.id),
           text: result || 'No model info available',
+          replyToMessageId,
+        });
+      }
+    });
+
+    // Handle /models
+    this.bot.command('models', async (ctx) => {
+      if (this.onCommand) {
+        const result = await this.onCommand('models', String(ctx.chat.id));
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'No models available',
           replyToMessageId,
         });
       }
