@@ -897,6 +897,48 @@ export class LettaBot implements AgentSession {
         lines.push('', 'Use `/model <handle>` to switch.');
         return lines.join('\n');
       }
+      case 'break-glass': {
+        const agentId = this.store.agentId;
+        if (!agentId) return 'No agent configured.';
+
+        // Determine which conversation to target
+        const convKey = channelId ? this.resolveConversationKey(channelId, chatId, forcePerChat) : 'shared';
+        const currentConvId = convKey === 'shared'
+          ? this.store.conversationId
+          : this.store.getConversationId(convKey);
+
+        const { deleteConversation, createConversation } = await import('../tools/letta-api.js');
+
+        if (!currentConvId) {
+          // No conversation stored - just delete the 'default' conversation
+          await deleteConversation(agentId, 'default');
+          // Clear local state and invalidate session
+          this.store.clearConversation(convKey);
+          this.store.resetRecoveryAttempts();
+          this.sessionManager.invalidateSession(convKey);
+          return '\u{1F527} Break-glass: deleted default conversation. Send a message to start fresh.';
+        }
+
+        // Create new conversation first
+        const newConvId = await createConversation(agentId);
+        if (!newConvId) {
+          return '\u{1F527} Break-glass: failed to create new conversation.';
+        }
+
+        // Delete old conversation
+        await deleteConversation(agentId, currentConvId);
+
+        // Update store with new conversation ID
+        if (convKey === 'shared') {
+          this.store.conversationId = newConvId;
+        } else {
+          this.store.setConversationId(convKey, newConvId);
+        }
+        this.store.resetRecoveryAttempts();
+        this.sessionManager.invalidateSession(convKey);
+
+        return `\u{1F527} Break-glass complete. Old conversation deleted, new conversation: ${newConvId}`;
+      }
       case 'models': {
         const { listModels } = await import('../tools/letta-api.js');
         const allModels = await listModels();
@@ -1260,6 +1302,22 @@ export class LettaBot implements AgentSession {
       errAny.includes('404') ||
       ((errAny.includes('agent') || errAny.includes('conversation')) && errAny.includes('not found')) ||
       errAny.includes('rate limit') || errAny.includes('429')
+    );
+  }
+
+  /**
+   * Detect if an error indicates corrupted conversation history (e.g., truncated
+   * tool call arguments that produce JSON parse errors on the inference backend).
+   */
+  private isCorruptedConversationError(errorDetail: StreamErrorDetail | null): boolean {
+    if (!errorDetail) return false;
+    const msg = errorDetail.message?.toLowerCase() || '';
+    // Match errors like "Expecting ',' delimiter" or other JSON parse failures
+    // from inference backends that validate tool call arguments in message history.
+    return (
+      (msg.includes('delimiter') && (msg.includes('expecting') || msg.includes('expected'))) ||
+      (msg.includes('json') && (msg.includes('decode') || msg.includes('parse') || msg.includes('invalid'))) ||
+      (msg.includes('unterminated string') && msg.includes('column'))
     );
   }
 
@@ -1748,6 +1806,43 @@ export class LettaBot implements AgentSession {
                   log.warn(`API-level recovery failed: ${result.details}`);
                 }
                 return this.processMessage(msg, adapter, true);
+              }
+
+              // Corrupted conversation recovery (JSON/delimiter errors from inference backend)
+              if (retryDecision.isTerminalError && !retried && this.store.agentId &&
+                  this.isCorruptedConversationError(lastErrorDetail)) {
+                log.warn('Corrupted conversation detected (JSON/delimiter error) -- creating new conversation...');
+                clearInterval(typingInterval);
+
+                const { createConversation } = await import('../tools/letta-api.js');
+                const newConvId = await createConversation(this.store.agentId);
+
+                if (newConvId) {
+                  // Update store with new conversation
+                  if (retryConvKey === 'shared') {
+                    this.store.conversationId = newConvId;
+                  } else {
+                    this.store.setConversationId(retryConvKey, newConvId);
+                  }
+                  this.store.resetRecoveryAttempts();
+                  this.sessionManager.invalidateSession(retryConvKey);
+                  session = null;
+
+                  log.info(`New conversation created: ${newConvId}, retrying message...`);
+
+                  // Notify the user
+                  try {
+                    await adapter.sendMessage({
+                      chatId: msg.chatId,
+                      text: '(Had to reset context due to a model error -- your message has been resent.)',
+                      threadId: msg.threadId,
+                    });
+                  } catch { /* best effort */ }
+
+                  return this.processMessage(msg, adapter, true);
+                } else {
+                  log.error('Failed to create new conversation for corrupted conversation recovery');
+                }
               }
 
               // Empty/error result retry
