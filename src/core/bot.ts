@@ -1838,10 +1838,18 @@ export class LettaBot implements AgentSession {
                 log.warn('Corrupted conversation detected (JSON/delimiter error) -- creating new conversation...');
                 clearInterval(typingInterval);
 
-                const { createConversation } = await import('../tools/letta-api.js');
+                const { createConversation, deleteConversation } = await import('../tools/letta-api.js');
+                const oldConvId = retryConvKey === 'shared'
+                  ? this.store.conversationId
+                  : this.store.getConversationId(retryConvKey);
                 const newConvId = await createConversation(this.store.agentId);
 
                 if (newConvId) {
+                  // Delete the corrupted conversation
+                  if (oldConvId) {
+                    await deleteConversation(this.store.agentId, oldConvId);
+                  }
+
                   // Update store with new conversation
                   if (retryConvKey === 'shared') {
                     this.store.conversationId = newConvId;
