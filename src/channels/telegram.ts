@@ -35,7 +35,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   'cancel',
   'setconv',
   'models',
-  'break_glass',
+  'breakglass',
   'help',
   'start',
 ]);
@@ -370,11 +370,11 @@ export class TelegramAdapter implements ChannelAdapter {
       }
     });
     
-    // Handle /break-glass [agent]
-    this.bot.command('break_glass', async (ctx) => {
+    // Handle /breakglass [agent]
+    this.bot.command('breakglass', async (ctx) => {
       if (this.onCommand) {
         const args = ctx.match?.trim() || undefined;
-        const result = await this.onCommand('break-glass', String(ctx.chat.id), args);
+        const result = await this.onCommand('breakglass', String(ctx.chat.id), args);
         const replyToMessageId =
           'message' in ctx && ctx.message
             ? String(ctx.message.message_id)

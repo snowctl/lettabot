@@ -919,7 +919,7 @@ export class LettaBot implements AgentSession {
         lines.push('', 'Use `/model <handle>` to switch.');
         return lines.join('\n');
       }
-      case 'break-glass': {
+      case 'breakglass': {
         const agentId = this.store.agentId;
         if (!agentId) return 'No agent configured.';
 
