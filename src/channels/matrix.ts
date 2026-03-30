@@ -246,11 +246,13 @@ function markdownToHtml(text: string): string {
 
   // Bold (** or __)
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
+  // __ bold only at word boundaries — avoid matching snake_case__names
+  html = html.replace(/(?<=^|[\s(>])__(?=\S)([\s\S]+?\S)__(?=$|[\s)<.,;:!?])/gm, '<strong>$1</strong>');
 
-  // Italic (* or _) — avoid matching inside words or math expressions
+  // Italic (* or _)
   html = html.replace(/(?<!\*)\*([^*]+?)\*(?!\*)/g, '<em>$1</em>');
-  html = html.replace(/(?<!_)_([^_]+?)_(?!_)/g, '<em>$1</em>');
+  // _ italic only at word boundaries — avoid matching snake_case_names, file_paths, etc.
+  html = html.replace(/(?<=^|[\s(>])_(?=\S)([^_]+?\S)_(?=$|[\s)<.,;:!?])/gm, '<em>$1</em>');
 
   // Strikethrough
   html = html.replace(/~~(.+?)~~/g, '<del>$1</del>');
