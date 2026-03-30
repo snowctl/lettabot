@@ -6,10 +6,11 @@
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundAttachment, InboundMessage, OutboundFile, OutboundMessage } from '../core/types.js';
+import type { InboundAttachment, InboundMessage, InboundReaction, OutboundFile, OutboundMessage } from '../core/types.js';
 import type { DmPolicy } from '../pairing/types.js';
-import { upsertPairingRequest } from '../pairing/store.js';
+import { isUserAllowed, upsertPairingRequest } from '../pairing/store.js';
 import { checkDmAccess } from './shared/access-control.js';
+import { isGroupApproved, approveGroup } from '../pairing/group-store.js';
 import { resolveEmoji } from './shared/emoji.js';
 import { splitMessageText } from './shared/message-splitter.js';
 import { buildAttachmentPath, downloadToFile } from './attachments.js';
@@ -24,6 +25,17 @@ const log = createLogger('Matrix');
 
 const MATRIX_SPLIT_THRESHOLD = 64000;
 const MATRIX_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15000;
+
+/** MIME types that indicate a voice/audio message eligible for transcription. */
+const VOICE_MIME_TYPES = new Set([
+  'audio/ogg', 'audio/opus', 'audio/webm', 'audio/mp4', 'audio/mpeg',
+  'audio/wav', 'audio/x-wav', 'audio/flac', 'audio/aac',
+]);
+
+function isVoiceMimeType(mimeType: string): boolean {
+  // Match exact type or audio/* with voice-like codecs
+  return VOICE_MIME_TYPES.has(mimeType) || mimeType.startsWith('audio/ogg');
+}
 
 const KNOWN_MATRIX_COMMANDS = new Set([
   'status', 'heartbeat', 'reset', 'cancel', 'approve', 'disapprove',
@@ -91,6 +103,7 @@ type MatrixClient = {
   setTyping(roomId: string, isTyping: boolean, timeoutMs?: number): Promise<void>;
   uploadContent(data: Buffer, opts?: { name?: string; type?: string }): Promise<string>;
   getJoinedRoomMembers(roomId: string): Promise<string[]>;
+  getRoomStateEvent(roomId: string, eventType: string, stateKey: string): Promise<Record<string, unknown>>;
   on(event: string, handler: (...args: unknown[]) => void): void;
 };
 
@@ -102,6 +115,7 @@ export class MatrixAdapter implements ChannelAdapter {
   private config: MatrixAdapterConfig;
   private running = false;
   private roomMemberCache: Map<string, number> = new Map();
+  private roomNameCache: Map<string, string> = new Map();
 
   onMessage?: (msg: InboundMessage) => Promise<void>;
   onCommand?: (command: string, chatId?: string, args?: string, forcePerChat?: boolean) => Promise<string | null>;
@@ -127,14 +141,32 @@ export class MatrixAdapter implements ChannelAdapter {
       this.roomMemberCache.set(roomId, count);
       return count <= 2;
     } catch (err) {
-      log.warn('Failed to get room members:', err);
+      log.warn('Failed to get room members for %s: %s', roomId, err);
       return true; // Default to DM for safety
     }
+  }
+
+  private async getRoomName(roomId: string): Promise<string | undefined> {
+    if (this.roomNameCache.has(roomId)) {
+      return this.roomNameCache.get(roomId);
+    }
+    try {
+      const nameEvent = await this.client!.getRoomStateEvent(roomId, 'm.room.name', '');
+      const name = nameEvent?.['name'] as string | undefined;
+      if (name) {
+        this.roomNameCache.set(roomId, name);
+        return name;
+      }
+    } catch {
+      // Room may not have a name set
+    }
+    return undefined;
   }
 
   async start(): Promise<void> {
     if (this.running) return;
 
+    log.info('Loading matrix-bot-sdk...');
     const sdk = await import('matrix-bot-sdk') as unknown as {
       SimpleFsStorageProvider: new (path: string) => unknown;
       MatrixClient: new (url: string, token: string, storage: unknown) => MatrixClient & { on(e: string, h: (...a: unknown[]) => void): void };
@@ -142,6 +174,7 @@ export class MatrixAdapter implements ChannelAdapter {
     };
 
     const storePath = this.config.storePath || './data/matrix-store';
+    log.info(`Storage path: ${storePath}`);
     const storage = new sdk.SimpleFsStorageProvider(storePath);
 
     const matrixClient = new sdk.MatrixClient(
@@ -151,9 +184,11 @@ export class MatrixAdapter implements ChannelAdapter {
     );
 
     sdk.AutojoinRoomsMixin.setupOnClient(matrixClient);
+    log.info('AutojoinRoomsMixin enabled');
 
     this.client = matrixClient as unknown as MatrixClient;
 
+    // Listen for messages
     matrixClient.on('room.message', ((...args: unknown[]) => {
       const [roomId, event] = args as [string, Record<string, unknown>];
       this.handleRoomMessage(roomId, event).catch((err) => {
@@ -161,11 +196,41 @@ export class MatrixAdapter implements ChannelAdapter {
       });
     }) as (...args: unknown[]) => void);
 
-    log.info('Connecting to Matrix homeserver...');
+    // Handle room events: cache invalidation + inbound reactions
+    matrixClient.on('room.event', ((...args: unknown[]) => {
+      const [roomId, event] = args as [string, Record<string, unknown>];
+      if (event['type'] === 'm.room.member') {
+        this.roomMemberCache.delete(roomId);
+      }
+      if (event['type'] === 'm.room.name') {
+        this.roomNameCache.delete(roomId);
+      }
+      if (event['type'] === 'm.reaction') {
+        this.handleReaction(roomId, event).catch((err) => {
+          log.error('Error handling m.reaction:', err);
+        });
+      }
+    }) as (...args: unknown[]) => void);
+
+    // Auto-approve groups when a paired user invites the bot (mirrors Telegram behavior)
+    matrixClient.on('room.join', ((...args: unknown[]) => {
+      const [roomId, event] = args as [string, Record<string, unknown>];
+      this.handleRoomJoin(roomId, event).catch((err) => {
+        log.error('Error handling room.join:', err);
+      });
+    }) as (...args: unknown[]) => void);
+
+    log.info(`Connecting to Matrix homeserver at ${this.config.homeserverUrl}...`);
     await matrixClient.start();
     this.running = true;
     log.info(`Matrix adapter started as ${this.config.userId}`);
     log.info(`DM policy: ${this.config.dmPolicy}`);
+    if (this.config.groups && Object.keys(this.config.groups).length > 0) {
+      log.info(`Configured groups: ${Object.keys(this.config.groups).join(', ')}`);
+    }
+    if (this.config.mentionPatterns?.length) {
+      log.info(`Mention patterns: ${this.config.mentionPatterns.join(', ')}`);
+    }
   }
 
   async stop(): Promise<void> {
@@ -177,6 +242,91 @@ export class MatrixAdapter implements ChannelAdapter {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  /**
+   * Handle the bot joining a room — auto-approve groups when a paired user invites.
+   * Mirrors Telegram's my_chat_member handler.
+   */
+  private async handleRoomJoin(roomId: string, _event: Record<string, unknown>): Promise<void> {
+    const isDm = await this.isRoomDm(roomId);
+    if (isDm) return; // DM rooms don't need group approval
+
+    const dmPolicy = this.config.dmPolicy || 'pairing';
+    if (dmPolicy !== 'pairing') {
+      await approveGroup('matrix', roomId);
+      log.info(`Group ${roomId} auto-approved (dmPolicy=${dmPolicy})`);
+      return;
+    }
+
+    // Try to identify who invited the bot by checking room members
+    // In most cases the inviter is the other member already in the room
+    try {
+      const members = await this.client!.getJoinedRoomMembers(roomId);
+      const otherMembers = members.filter(m => m !== this.config.userId);
+      const configAllowlist = this.config.allowedUsers;
+
+      for (const memberId of otherMembers) {
+        const allowed = await isUserAllowed('matrix', memberId, configAllowlist);
+        if (allowed) {
+          await approveGroup('matrix', roomId);
+          log.info(`Group ${roomId} approved by paired user ${memberId}`);
+          return;
+        }
+      }
+      log.info(`Joined group ${roomId} but no paired users found — group not approved`);
+    } catch (err) {
+      log.warn('Failed to check group members for approval:', err);
+    }
+  }
+
+  /**
+   * Handle inbound m.reaction events — mirrors Telegram's message_reaction handler.
+   */
+  private async handleReaction(roomId: string, event: Record<string, unknown>): Promise<void> {
+    const sender = event['sender'] as string | undefined;
+    if (!sender || sender === this.config.userId) return;
+
+    const content = event['content'] as Record<string, unknown> | undefined;
+    if (!content) return;
+
+    const relatesTo = content['m.relates_to'] as Record<string, unknown> | undefined;
+    if (!relatesTo) return;
+
+    const targetEventId = relatesTo['event_id'] as string | undefined;
+    const emoji = relatesTo['key'] as string | undefined;
+    if (!targetEventId || !emoji) return;
+
+    // DM access check
+    const isDm = await this.isRoomDm(roomId);
+    if (isDm) {
+      const access = await this.checkAccess(sender);
+      if (access !== 'allowed') return;
+    }
+
+    log.info(`Reaction ${emoji} from ${sender} on ${targetEventId} in ${roomId}`);
+
+    if (!this.onMessage) return;
+
+    // Matrix doesn't distinguish add/remove in the event itself — reactions are always "added"
+    // (redactions handle removal, which is a separate event type)
+    const reaction: InboundReaction = {
+      emoji,
+      messageId: targetEventId,
+      action: 'added',
+    };
+
+    await this.onMessage({
+      channel: 'matrix' as import('../core/types.js').ChannelId,
+      chatId: roomId,
+      userId: sender,
+      userName: sender,
+      messageId: targetEventId,
+      text: '',
+      timestamp: new Date(),
+      reaction,
+      formatterHints: this.getFormatterHints(),
+    });
   }
 
   private async handleRoomMessage(roomId: string, event: Record<string, unknown>): Promise<void> {
@@ -197,8 +347,20 @@ export class MatrixAdapter implements ChannelAdapter {
     const isDm = await this.isRoomDm(roomId);
     const isGroup = !isDm;
 
+    log.info(`Message from ${sender} in ${isDm ? 'DM' : 'group'} ${roomId} (type: ${msgtype})`);
+
+    // Group approval check (mirrors Telegram's pairing-based group gating)
+    if (isGroup) {
+      const dmPolicy = this.config.dmPolicy || 'pairing';
+      if (dmPolicy !== 'open' && !(await isGroupApproved('matrix', roomId))) {
+        log.info(`Group ${roomId} not approved, ignoring message`);
+        return;
+      }
+    }
+
     if (isDm) {
       const access = await this.checkAccess(sender);
+      log.info(`DM access check for ${sender}: ${access}`);
       if (access === 'blocked') {
         await this.client!.sendMessage(roomId, {
           msgtype: 'm.text',
@@ -233,28 +395,40 @@ export class MatrixAdapter implements ChannelAdapter {
 
     const wasMentioned = isGroup ? this.isMentioned(body) : undefined;
     let groupMode: GroupMode | undefined;
+    let groupName: string | undefined;
 
     // Group gating
-    if (isGroup && this.config.groups) {
-      const keys = [roomId];
-      if (!isGroupAllowed(this.config.groups, keys)) {
-        log.info(`Room ${roomId} not in allowlist, ignoring`);
-        return;
-      }
-      if (!isGroupUserAllowed(this.config.groups, keys, sender)) {
-        return;
-      }
-      groupMode = resolveGroupMode(this.config.groups, keys, 'open');
-      if (groupMode === 'disabled') return;
-      if (groupMode === 'mention-only' && !wasMentioned) return;
+    if (isGroup) {
+      groupName = await this.getRoomName(roomId);
 
-      const limits = resolveDailyLimits(this.config.groups, keys);
-      const counterScope = limits.matchedKey ?? roomId;
-      const counterKey = `${this.config.agentName ?? ''}:matrix:${counterScope}`;
-      const limitResult = checkDailyLimit(counterKey, sender, limits);
-      if (!limitResult.allowed) {
-        log.info(`Daily limit reached for ${counterKey} (${limitResult.reason})`);
-        return;
+      if (this.config.groups) {
+        const keys = [roomId];
+        if (!isGroupAllowed(this.config.groups, keys)) {
+          log.info(`Room ${roomId} (${groupName ?? 'unnamed'}) not in allowlist, ignoring`);
+          return;
+        }
+        if (!isGroupUserAllowed(this.config.groups, keys, sender)) {
+          log.info(`User ${sender} not allowed in group ${roomId}`);
+          return;
+        }
+        groupMode = resolveGroupMode(this.config.groups, keys, 'open');
+        if (groupMode === 'disabled') {
+          log.info(`Group ${roomId} mode is disabled, ignoring`);
+          return;
+        }
+        if (groupMode === 'mention-only' && !wasMentioned) {
+          log.info(`Group ${roomId} is mention-only and bot was not mentioned, ignoring`);
+          return;
+        }
+
+        const limits = resolveDailyLimits(this.config.groups, keys);
+        const counterScope = limits.matchedKey ?? roomId;
+        const counterKey = `${this.config.agentName ?? ''}:matrix:${counterScope}`;
+        const limitResult = checkDailyLimit(counterKey, sender, limits);
+        if (!limitResult.allowed) {
+          log.info(`Daily limit reached for ${counterKey} (${limitResult.reason})`);
+          return;
+        }
       }
     }
 
@@ -264,6 +438,7 @@ export class MatrixAdapter implements ChannelAdapter {
       const cmdArgs = parts.slice(1).join(' ') || undefined;
 
       if (command && KNOWN_MATRIX_COMMANDS.has(command)) {
+        log.info(`Command: /${command}${cmdArgs ? ` ${cmdArgs}` : ''} from ${sender}`);
         if (command === 'help' || command === 'start') {
           await this.client!.sendMessage(roomId, {
             msgtype: 'm.text',
@@ -282,6 +457,14 @@ export class MatrixAdapter implements ChannelAdapter {
           }
           return;
         }
+      } else if (command) {
+        // Unknown command — send feedback (mirrors Telegram behavior)
+        log.info(`Unknown command: /${command} from ${sender}`);
+        await this.client!.sendMessage(roomId, {
+          msgtype: 'm.text',
+          body: `Unknown command: /${command}\nTry /help.`,
+        });
+        return;
       }
     }
 
@@ -335,12 +518,20 @@ export class MatrixAdapter implements ChannelAdapter {
       }
 
       attachments.push(attachment);
+      log.info(`Attachment: ${kind} "${fileName}" from ${sender}`);
+
+      // Voice transcription: if this is an audio message with a voice MIME type, transcribe it
+      // Mirrors Telegram's message:voice handler
+      if (kind === 'audio' && mimeType && isVoiceMimeType(mimeType) && httpUrl) {
+        text = await this.tryTranscribeVoice(httpUrl, fileName, roomId);
+      }
     }
 
     if (!text && attachments.length === 0) return;
 
     const isListeningMode = groupMode === 'listen' && !wasMentioned;
 
+    log.info(`Forwarding message to bot core (group=${isGroup}, listening=${isListeningMode}, mentioned=${wasMentioned})`);
     await this.onMessage({
       channel: 'matrix' as import('../core/types.js').ChannelId,
       chatId: roomId,
@@ -351,6 +542,7 @@ export class MatrixAdapter implements ChannelAdapter {
       text,
       timestamp,
       isGroup,
+      groupName,
       wasMentioned,
       isListeningMode,
       attachments,
@@ -372,12 +564,49 @@ export class MatrixAdapter implements ChannelAdapter {
     return false;
   }
 
+  /**
+   * Attempt to transcribe a voice/audio message. Mirrors Telegram's voice handler.
+   * Returns the transcription text or an error description.
+   */
+  private async tryTranscribeVoice(httpUrl: string, fileName: string, roomId: string): Promise<string> {
+    const { isTranscriptionConfigured } = await import('../transcription/index.js');
+    if (!isTranscriptionConfigured()) {
+      log.info('Voice message received but transcription not configured');
+      await this.client!.sendMessage(roomId, {
+        msgtype: 'm.text',
+        body: 'Voice messages require a transcription API key.',
+      });
+      return '';
+    }
+
+    try {
+      log.info(`Transcribing voice message: ${fileName}`);
+      const response = await fetch(httpUrl);
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      const { transcribeAudio } = await import('../transcription/index.js');
+      const result = await transcribeAudio(buffer, fileName);
+
+      if (result.success && result.text) {
+        log.info(`Transcribed voice message: "${result.text.slice(0, 50)}..."`);
+        return `[Voice message]: ${result.text}`;
+      } else {
+        log.error(`Transcription failed: ${result.error}`);
+        return `[Voice message - transcription failed: ${result.error}]`;
+      }
+    } catch (error) {
+      log.error('Error processing voice message:', error);
+      return `[Voice message - error: ${error instanceof Error ? error.message : 'unknown error'}]`;
+    }
+  }
+
   async sendMessage(msg: OutboundMessage): Promise<{ messageId: string }> {
     if (!this.client) throw new Error('Matrix adapter not started');
 
     const chunks = splitMessageText(msg.text, MATRIX_SPLIT_THRESHOLD);
     let lastEventId = '';
 
+    log.info(`Sending message to ${msg.chatId} (${chunks.length} chunk(s), ${msg.text.length} chars)`);
     for (const chunk of chunks) {
       const htmlBody = markdownToHtml(chunk);
       const eventId = await this.client.sendMessage(msg.chatId, {
@@ -396,6 +625,7 @@ export class MatrixAdapter implements ChannelAdapter {
     if (!this.client) throw new Error('Matrix adapter not started');
 
     const fileName = basename(file.filePath);
+    log.info(`Sending file "${fileName}" (${file.kind}) to ${file.chatId}`);
     const buffer = await readFile(file.filePath);
     const mxcUrl = await this.client.uploadContent(buffer, { name: fileName });
 
@@ -415,6 +645,7 @@ export class MatrixAdapter implements ChannelAdapter {
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
     if (!this.client) throw new Error('Matrix adapter not started');
 
+    log.info(`Editing message ${messageId} in ${chatId}`);
     const htmlBody = markdownToHtml(text);
     await this.client.sendMessage(chatId, {
       msgtype: 'm.text',

@@ -1300,6 +1300,12 @@ async function stepFeatures(config: OnboardConfig): Promise<void> {
         message: 'Maximum interval (minutes)',
         placeholder: defaultMax,
         initialValue: config.heartbeat.intervalMax || defaultMax,
+        validate: (v) => {
+          const max = parseInt(v, 10);
+          const min = parseInt(config.heartbeat.interval || '240', 10);
+          if (isNaN(max) || max <= 0) return 'Must be a positive number';
+          if (max <= min) return `Must be greater than the minimum interval (${min}m)`;
+        },
       });
       if (!p.isCancel(intervalMax)) config.heartbeat.intervalMax = intervalMax || defaultMax;
     } else if (!p.isCancel(useRandom)) {
