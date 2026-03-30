@@ -33,6 +33,15 @@ export function isSignalCliInstalled(): boolean {
   return spawnSync('which', ['signal-cli'], { stdio: 'pipe' }).status === 0;
 }
 
+async function promptStreaming(existing?: any): Promise<boolean | undefined> {
+  const streaming = await p.confirm({
+    message: 'Stream responses? (progressively edit message as it generates)',
+    initialValue: existing?.streaming ?? false,
+  });
+  if (p.isCancel(streaming)) return undefined;
+  return streaming;
+}
+
 export function getChannelHint(id: ChannelId): string {
   if (id === 'signal' && !isSignalCliInstalled()) {
     return '⚠️ signal-cli not installed';
@@ -237,12 +246,14 @@ export async function setupTelegram(existing?: any): Promise<any> {
   }
   
   const groupSettings = await promptGroupSettings('telegram', existing);
+  const streaming = await promptStreaming(existing);
 
   return {
     enabled: true,
     token: token || undefined,
     dmPolicy: dmPolicy as 'pairing' | 'allowlist' | 'open',
     allowedUsers,
+    ...(streaming !== undefined ? { streaming } : {}),
     ...groupSettings,
   };
 }
@@ -281,11 +292,13 @@ export async function setupSlack(existing?: any): Promise<any> {
     
     if (result) {
       const groupSettings = await promptGroupSettings('slack', existing);
+      const streaming = await promptStreaming(existing);
       return {
         enabled: true,
         appToken: result.appToken,
         botToken: result.botToken,
         allowedUsers: result.allowedUsers,
+        ...(streaming !== undefined ? { streaming } : {}),
         ...groupSettings,
       };
     }
@@ -331,12 +344,14 @@ export async function setupSlack(existing?: any): Promise<any> {
   
   const allowedUsers = await stepAccessControl(existing?.allowedUsers);
   const groupSettings = await promptGroupSettings('slack', existing);
-  
+  const streaming = await promptStreaming(existing);
+
   return {
     enabled: true,
     appToken: appToken || undefined,
     botToken: botToken || undefined,
     allowedUsers,
+    ...(streaming !== undefined ? { streaming } : {}),
     ...groupSettings,
   };
 }
@@ -410,12 +425,14 @@ export async function setupDiscord(existing?: any): Promise<any> {
   }
   
   const groupSettings = await promptGroupSettings('discord', existing);
+  const streaming = await promptStreaming(existing);
 
   return {
     enabled: true,
     token: token || undefined,
     dmPolicy: dmPolicy as 'pairing' | 'allowlist' | 'open',
     allowedUsers,
+    ...(streaming !== undefined ? { streaming } : {}),
     ...groupSettings,
   };
 }
@@ -770,12 +787,15 @@ export async function setupMatrix(existing?: any): Promise<any> {
     process.exit(0);
   }
 
+  const streaming = await promptStreaming(existing);
+
   return {
     enabled: true,
     homeserverUrl: (homeserverUrl as string).trim(),
     userId: (userId as string).trim(),
     accessToken: (accessToken as string).trim(),
     dmPolicy,
+    ...(streaming !== undefined ? { streaming } : {}),
   };
 }
 
