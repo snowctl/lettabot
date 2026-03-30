@@ -306,6 +306,13 @@ type NonInteractiveProjectionSource = {
     instantGroups?: string[];
     listeningGroups?: string[];
   };
+  matrix: {
+    enabled: boolean;
+    homeserverUrl?: string;
+    userId?: string;
+    accessToken?: string;
+    dmPolicy?: 'pairing' | 'allowlist' | 'open';
+  };
 };
 
 export type AgentProjectionInput = {
@@ -361,6 +368,13 @@ export type AgentProjectionInput = {
     groupPollIntervalMin?: number;
     instantGroups?: string[];
     listeningGroups?: string[];
+  };
+  matrix: {
+    enabled: boolean;
+    homeserverUrl?: string;
+    userId?: string;
+    accessToken?: string;
+    dmPolicy?: 'pairing' | 'allowlist' | 'open';
   };
   cronEnabled: boolean;
   heartbeat: { enabled: boolean; intervalMin?: number };
@@ -422,6 +436,13 @@ export function toProjectionInputFromNonInteractiveConfig(config: NonInteractive
       instantGroups: config.signal.instantGroups,
       listeningGroups: config.signal.listeningGroups,
     },
+    matrix: {
+      enabled: config.matrix.enabled,
+      homeserverUrl: config.matrix.homeserverUrl,
+      userId: config.matrix.userId,
+      accessToken: config.matrix.accessToken,
+      dmPolicy: config.matrix.dmPolicy,
+    },
     cronEnabled: false,
     heartbeat: { enabled: false, intervalMin: 60 },
     google: { enabled: false, accounts: [] },
@@ -482,6 +503,13 @@ export function toProjectionInputFromOnboardConfig(config: OnboardConfig): Agent
       groupPollIntervalMin: config.signal.groupPollIntervalMin,
       instantGroups: config.signal.instantGroups,
       listeningGroups: config.signal.listeningGroups,
+    },
+    matrix: {
+      enabled: config.matrix.enabled,
+      homeserverUrl: config.matrix.homeserverUrl,
+      userId: config.matrix.userId,
+      accessToken: config.matrix.accessToken,
+      dmPolicy: config.matrix.dmPolicy,
     },
     cronEnabled: config.cron,
     heartbeat: {
@@ -556,6 +584,15 @@ export function buildProjectedAgentConfig(input: AgentProjectionInput): AgentCon
           groupPollIntervalMin: input.signal.groupPollIntervalMin,
           instantGroups: input.signal.instantGroups,
           listeningGroups: input.signal.listeningGroups,
+        }
+      } : {}),
+      ...(input.matrix.enabled ? {
+        matrix: {
+          enabled: true,
+          homeserverUrl: input.matrix.homeserverUrl,
+          accessToken: input.matrix.accessToken,
+          userId: input.matrix.userId,
+          dmPolicy: input.matrix.dmPolicy,
         }
       } : {}),
     },
