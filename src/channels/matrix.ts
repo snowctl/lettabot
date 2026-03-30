@@ -61,6 +61,10 @@ export interface MatrixAdapterConfig {
 
 /**
  * Convert mxc:// URI to an HTTPS download URL.
+ *
+ * Uses the authenticated client media endpoint (Matrix v1.11+) which
+ * requires a Bearer token.  Falls back to the legacy /_matrix/media/v3
+ * path only when the caller cannot supply auth.
  */
 function mxcToHttp(homeserverUrl: string, mxcUrl: string): string {
   const withoutScheme = mxcUrl.slice('mxc://'.length);
@@ -68,7 +72,7 @@ function mxcToHttp(homeserverUrl: string, mxcUrl: string): string {
   if (slashIdx === -1) return mxcUrl;
   const server = withoutScheme.slice(0, slashIdx);
   const mediaId = withoutScheme.slice(slashIdx + 1);
-  return `${homeserverUrl}/_matrix/media/v3/download/${server}/${mediaId}`;
+  return `${homeserverUrl}/_matrix/client/v1/media/download/${server}/${mediaId}`;
 }
 
 /**
@@ -687,6 +691,7 @@ export class MatrixAdapter implements ChannelAdapter {
             try {
               await downloadToFile(httpUrl, target, {
                 timeoutMs: MATRIX_ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
+                headers: { 'Authorization': `Bearer ${this.config.accessToken}` },
               });
               attachment.localPath = target;
               log.info(`Attachment saved to ${target}`);
@@ -763,7 +768,9 @@ export class MatrixAdapter implements ChannelAdapter {
 
     try {
       log.info(`Transcribing voice message: ${fileName}`);
-      const response = await fetch(httpUrl);
+      const response = await fetch(httpUrl, {
+        headers: { 'Authorization': `Bearer ${this.config.accessToken}` },
+      });
       const buffer = Buffer.from(await response.arrayBuffer());
 
       const { transcribeAudio } = await import('../transcription/index.js');
