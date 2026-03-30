@@ -39,6 +39,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   'models',
   'breakglass',
   'recompile',
+  'palace',
   'help',
   'start',
 ]);
@@ -421,6 +422,22 @@ export class TelegramAdapter implements ChannelAdapter {
         await this.sendMessage({
           chatId: String(ctx.chat.id),
           text: result || 'Recompile complete',
+          replyToMessageId,
+        });
+      }
+    });
+
+    // Handle /palace
+    this.bot.command('palace', async (ctx) => {
+      if (this.onCommand) {
+        const result = await this.onCommand('palace', String(ctx.chat.id));
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'No memory blocks found.',
           replyToMessageId,
         });
       }

@@ -1043,6 +1043,48 @@ export class LettaBot implements AgentSession {
         }
         return 'Failed to recompile. Check server logs.';
       }
+      case 'palace': {
+        const agentId = this.store.agentId;
+        if (!agentId) return 'No agent configured.';
+
+        const { getAgentMemoryBlocks } = await import('../tools/letta-api.js');
+        const blocks = await getAgentMemoryBlocks(agentId);
+        if (blocks.length === 0) return 'No memory blocks found.';
+
+        // Sort: persona/* first, then human/*, then others
+        blocks.sort((a, b) => {
+          const order = (label: string) =>
+            label.startsWith('persona/') ? 0 :
+            label.startsWith('human/') ? 1 : 2;
+          return order(a.label) - order(b.label) || a.label.localeCompare(b.label);
+        });
+
+        const lines: string[] = ['**Memory Palace**', ''];
+        for (const block of blocks) {
+          const usage = block.limit
+            ? ` (${block.value.length}/${block.limit} chars)`
+            : '';
+          lines.push(`**${block.label}**${usage}`);
+          if (block.description) {
+            lines.push(`_${block.description}_`);
+          }
+          // Show a preview of the value (first 300 chars)
+          const preview = block.value.trim();
+          if (preview) {
+            const truncated = preview.length > 300
+              ? preview.slice(0, 297) + '...'
+              : preview;
+            lines.push('```');
+            lines.push(truncated);
+            lines.push('```');
+          } else {
+            lines.push('_(empty)_');
+          }
+          lines.push('');
+        }
+
+        return lines.join('\n');
+      }
       case 'models': {
         const { listModels } = await import('../tools/letta-api.js');
         const allModels = await listModels();

@@ -216,6 +216,30 @@ export async function agentExists(agentId: string): Promise<boolean> {
 }
 
 /**
+ * Get an agent's core memory blocks.
+ */
+export async function getAgentMemoryBlocks(agentId: string): Promise<Array<{ label: string; value: string; description?: string | null; limit?: number }>> {
+  try {
+    const client = getClient();
+    const blocks: Array<{ label: string; value: string; description?: string | null; limit?: number }> = [];
+    for await (const block of client.agents.blocks.list(agentId)) {
+      if (block.label && typeof block.value === 'string') {
+        blocks.push({
+          label: block.label,
+          value: block.value,
+          description: block.description,
+          limit: block.limit,
+        });
+      }
+    }
+    return blocks;
+  } catch (e) {
+    log.error('Failed to get agent memory blocks:', e);
+    return [];
+  }
+}
+
+/**
  * Get an agent's current model handle
  */
 export async function getAgentModel(agentId: string): Promise<string | null> {

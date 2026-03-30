@@ -40,6 +40,7 @@ function isVoiceMimeType(mimeType: string): boolean {
 const KNOWN_MATRIX_COMMANDS = new Set([
   'status', 'heartbeat', 'reset', 'cancel', 'approve', 'disapprove',
   'help', 'start', 'model', 'models', 'setconv', 'breakglass', 'recompile',
+  'palace',
 ]);
 
 export interface MatrixAdapterConfig {
