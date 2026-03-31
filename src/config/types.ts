@@ -432,6 +432,7 @@ export interface MatrixConfig {
   instantGroups?: string[];      // Room IDs that bypass batching
   listeningGroups?: string[];    // @deprecated Use groups.<id>.mode = "listen"
   e2ee?: boolean;                // Enable end-to-end encryption support
+  recoveryKey?: string;          // Matrix recovery key for E2EE key backup + cross-signing
   storePath?: string;            // Path for bot state storage (default: ./data/matrix-store)
 }
 

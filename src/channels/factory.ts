@@ -148,6 +148,7 @@ const SHARED_CHANNEL_BUILDERS: SharedChannelBuilder[] = [
         groups: matrix.groups,
         agentName: agentConfig.name,
         e2ee: matrix.e2ee,
+        recoveryKey: matrix.recoveryKey,
         storePath: matrix.storePath,
       });
     },

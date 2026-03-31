@@ -9,39 +9,61 @@ vi.mock('./shared/access-control.js', () => ({
   checkDmAccess: vi.fn().mockReturnValue('allowed'),
 }));
 
-vi.mock('matrix-bot-sdk', () => {
-  const mockClient = {
-    start: vi.fn().mockResolvedValue(undefined),
-    stop: vi.fn().mockResolvedValue(undefined),
-    sendMessage: vi.fn().mockResolvedValue('$event123'),
-    sendEvent: vi.fn().mockResolvedValue('$event456'),
-    uploadContent: vi.fn().mockResolvedValue('mxc://example.com/media123'),
-    setTyping: vi.fn().mockResolvedValue(undefined),
-    getUserId: vi.fn().mockReturnValue('@bot:example.com'),
-    getJoinedRoomMembers: vi.fn().mockResolvedValue(['@bot:example.com', '@user:example.com']),
-    on: vi.fn(),
-  };
+vi.mock('./matrix-crypto.js', () => ({
+  getCryptoCallbacks: vi.fn().mockReturnValue({}),
+  initE2EE: vi.fn().mockResolvedValue(undefined),
+  checkAndRestoreKeyBackup: vi.fn().mockResolvedValue(undefined),
+}));
 
-  // Use a class so `new MatrixClient(...)` works
-  class MockMatrixClient {
-    constructor() { return mockClient; }
-  }
+vi.mock('fake-indexeddb/auto', () => ({}));
 
-  return {
-    MatrixClient: MockMatrixClient,
-    SimpleFsStorageProvider: vi.fn(),
-    AutojoinRoomsMixin: { setupOnClient: vi.fn() },
-    __mockClient: mockClient,
-  };
-});
+const mockRoom = {
+  roomId: '!room:example.com',
+  getJoinedMembers: vi.fn().mockReturnValue([
+    { userId: '@bot:example.com' },
+    { userId: '@user:example.com' },
+  ]),
+  currentState: {
+    getStateEvents: vi.fn().mockReturnValue(null),
+  },
+};
 
-// The matrix adapter may not exist in this worktree yet — that's expected.
+const mockClient = {
+  startClient: vi.fn().mockResolvedValue(undefined),
+  stopClient: vi.fn(),
+  sendMessage: vi.fn().mockResolvedValue({ event_id: '$event123' }),
+  sendEvent: vi.fn().mockResolvedValue({ event_id: '$event456' }),
+  uploadContent: vi.fn().mockResolvedValue({ content_uri: 'mxc://example.com/media123' }),
+  sendTyping: vi.fn().mockResolvedValue(undefined),
+  getUserId: vi.fn().mockReturnValue('@bot:example.com'),
+  getRoom: vi.fn().mockReturnValue(mockRoom),
+  joinRoom: vi.fn().mockResolvedValue(undefined),
+  on: vi.fn(),
+  once: vi.fn(),
+  initRustCrypto: vi.fn().mockResolvedValue(undefined),
+  getCrypto: vi.fn().mockReturnValue(null),
+};
+
+vi.mock('matrix-js-sdk', () => ({
+  createClient: vi.fn().mockReturnValue(mockClient),
+  RoomEvent: {
+    MyMembership: 'Room.myMembership',
+    Timeline: 'Room.timeline',
+  },
+  ClientEvent: {
+    Sync: 'sync',
+  },
+  KnownMembership: {
+    Invite: 'invite',
+    Join: 'join',
+  },
+}));
+
 let MatrixAdapter: any;
-let mc: any;
+let mc: typeof mockClient;
 
 beforeAll(async () => {
-  const mod = await import('matrix-bot-sdk');
-  mc = (mod as any).__mockClient;
+  mc = mockClient;
 
   try {
     const adapterMod = await import('./matrix.js');
@@ -54,32 +76,54 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.clearAllMocks();
   // Restore mock implementations cleared by clearAllMocks
-  mc.start.mockResolvedValue(undefined);
-  mc.stop.mockResolvedValue(undefined);
-  mc.sendMessage.mockResolvedValue('$event123');
-  mc.sendEvent.mockResolvedValue('$event456');
-  mc.uploadContent.mockResolvedValue('mxc://example.com/media123');
-  mc.setTyping.mockResolvedValue(undefined);
+  mc.startClient.mockResolvedValue(undefined);
+  mc.sendMessage.mockResolvedValue({ event_id: '$event123' });
+  mc.sendEvent.mockResolvedValue({ event_id: '$event456' });
+  mc.uploadContent.mockResolvedValue({ content_uri: 'mxc://example.com/media123' });
+  mc.sendTyping.mockResolvedValue(undefined);
   mc.getUserId.mockReturnValue('@bot:example.com');
-  mc.getJoinedRoomMembers.mockResolvedValue(['@bot:example.com', '@user:example.com']);
+  mc.getRoom.mockReturnValue(mockRoom);
+  mockRoom.getJoinedMembers.mockReturnValue([
+    { userId: '@bot:example.com' },
+    { userId: '@user:example.com' },
+  ]);
 });
 
 function skipIfNoAdapter() {
   return !MatrixAdapter;
 }
 
-/** Finds the handler registered via client.on(eventName, handler). */
+/**
+ * Finds the handler registered via client.on(eventName, handler).
+ * For RoomEvent.Timeline, events come as (MatrixEvent, Room, toStartOfTimeline).
+ */
 function getOnHandler(eventName: string): ((...args: any[]) => Promise<void>) | undefined {
   const call = (mc.on.mock.calls as Array<[string, (...args: any[]) => void]>)
     .find(([name]) => name === eventName);
   if (!call) return undefined;
   const rawHandler = call[1];
-  // The adapter wraps handleRoomMessage in a fire-and-forget .catch().
-  // We need to give the async handler time to complete.
   return async (...args: any[]) => {
     rawHandler(...args);
-    // Allow microtasks to flush (the handler is async internally)
     await new Promise(resolve => setTimeout(resolve, 50));
+  };
+}
+
+/** Create a mock MatrixEvent-like object */
+function makeEvent(opts: {
+  type: string;
+  sender: string;
+  content: Record<string, unknown>;
+  eventId?: string;
+  ts?: number;
+  roomId?: string;
+}) {
+  return {
+    getType: () => opts.type,
+    getSender: () => opts.sender,
+    getContent: () => opts.content,
+    getId: () => opts.eventId || '$test:example.com',
+    getTs: () => opts.ts || Date.now(),
+    getRoomId: () => opts.roomId || '!room:example.com',
   };
 }
 
@@ -121,7 +165,7 @@ describe('MatrixAdapter lifecycle', () => {
     if (skipIfNoAdapter()) return;
     const adapter = new MatrixAdapter(BASE_CONFIG);
     await adapter.start();
-    expect(mc.start).toHaveBeenCalledTimes(1);
+    expect(mc.startClient).toHaveBeenCalledTimes(1);
   });
 
   it('isRunning() returns true after start', async () => {
@@ -136,7 +180,7 @@ describe('MatrixAdapter lifecycle', () => {
     const adapter = new MatrixAdapter(BASE_CONFIG);
     await adapter.start();
     await adapter.stop();
-    expect(mc.stop).toHaveBeenCalledTimes(1);
+    expect(mc.stopClient).toHaveBeenCalledTimes(1);
   });
 
   it('isRunning() returns false after stop', async () => {
@@ -265,24 +309,24 @@ describe('MatrixAdapter addReaction', () => {
 });
 
 describe('MatrixAdapter typing indicators', () => {
-  it('sendTypingIndicator calls setTyping with true and a timeout', async () => {
+  it('sendTypingIndicator calls sendTyping with true and a timeout', async () => {
     if (skipIfNoAdapter()) return;
     const adapter = new MatrixAdapter(BASE_CONFIG);
     await adapter.start();
 
     await adapter.sendTypingIndicator('!room:example.com');
 
-    expect(mc.setTyping).toHaveBeenCalledWith('!room:example.com', true, expect.any(Number));
+    expect(mc.sendTyping).toHaveBeenCalledWith('!room:example.com', true, expect.any(Number));
   });
 
-  it('stopTypingIndicator calls setTyping with false', async () => {
+  it('stopTypingIndicator calls sendTyping with false', async () => {
     if (skipIfNoAdapter()) return;
     const adapter = new MatrixAdapter(BASE_CONFIG);
     await adapter.start();
 
     await adapter.stopTypingIndicator?.('!room:example.com');
 
-    expect(mc.setTyping).toHaveBeenCalledWith('!room:example.com', false);
+    expect(mc.sendTyping).toHaveBeenCalledWith('!room:example.com', false, expect.any(Number));
   });
 });
 
@@ -325,7 +369,6 @@ describe('MatrixAdapter getDmPolicy', () => {
 });
 
 describe('MatrixAdapter message handling', () => {
-  // Use open DM policy so access control doesn't block test messages
   const OPEN_CONFIG = { ...BASE_CONFIG, dmPolicy: 'open' as const };
 
   it('ignores messages from self', async () => {
@@ -335,15 +378,16 @@ describe('MatrixAdapter message handling', () => {
     adapter.onMessage = onMessage;
     await adapter.start();
 
-    const handler = getOnHandler('room.message');
+    const handler = getOnHandler('Room.timeline');
     if (handler) {
-      await handler('!room:example.com', {
+      const event = makeEvent({
         type: 'm.room.message',
         sender: '@bot:example.com',
         content: { msgtype: 'm.text', body: 'hello from self' },
-        event_id: '$self:example.com',
-        origin_server_ts: Date.now(),
+        eventId: '$self:example.com',
       });
+      // (event, room, toStartOfTimeline)
+      await handler(event, mockRoom, false);
       expect(onMessage).not.toHaveBeenCalled();
     }
   });
@@ -355,15 +399,15 @@ describe('MatrixAdapter message handling', () => {
     adapter.onCommand = onCommand;
     await adapter.start();
 
-    const handler = getOnHandler('room.message');
+    const handler = getOnHandler('Room.timeline');
     if (handler) {
-      await handler('!room:example.com', {
+      const event = makeEvent({
         type: 'm.room.message',
         sender: '@user:example.com',
         content: { msgtype: 'm.text', body: '/status' },
-        event_id: '$cmd:example.com',
-        origin_server_ts: Date.now(),
+        eventId: '$cmd:example.com',
       });
+      await handler(event, mockRoom, false);
       expect(onCommand).toHaveBeenCalled();
     }
   });
@@ -375,15 +419,15 @@ describe('MatrixAdapter message handling', () => {
     adapter.onMessage = onMessage;
     await adapter.start();
 
-    const handler = getOnHandler('room.message');
+    const handler = getOnHandler('Room.timeline');
     if (handler) {
-      await handler('!room:example.com', {
+      const event = makeEvent({
         type: 'm.room.message',
         sender: '@user:example.com',
         content: { msgtype: 'm.text', body: 'hello bot' },
-        event_id: '$msg:example.com',
-        origin_server_ts: Date.now(),
+        eventId: '$msg:example.com',
       });
+      await handler(event, mockRoom, false);
       expect(onMessage).toHaveBeenCalledWith(
         expect.objectContaining({ chatId: '!room:example.com', text: 'hello bot' }),
       );

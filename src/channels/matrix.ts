@@ -1,7 +1,7 @@
 /**
  * Matrix Channel Adapter
  *
- * Uses matrix-bot-sdk for Matrix homeserver communication.
+ * Uses matrix-js-sdk for Matrix homeserver communication with E2EE support.
  * Supports DM pairing for secure access control.
  */
 
@@ -20,6 +20,9 @@ import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 
 import { createLogger } from '../logger.js';
+import { markdownToHtml } from './matrix-html-formatter.js';
+import { getCryptoCallbacks, initE2EE, checkAndRestoreKeyBackup } from './matrix-crypto.js';
+
 
 const log = createLogger('Matrix');
 
@@ -57,6 +60,7 @@ export interface MatrixAdapterConfig {
   groups?: Record<string, GroupModeConfig>;
   agentName?: string;
   e2ee?: boolean;
+  recoveryKey?: string;
   storePath?: string;
 }
 
@@ -76,230 +80,15 @@ function mxcToHttp(homeserverUrl: string, mxcUrl: string): string {
   return `${homeserverUrl}/_matrix/client/v1/media/download/${server}/${mediaId}`;
 }
 
-/**
- * Convert Markdown to Matrix-compatible HTML.
- *
- * Handles: code blocks, inline code, bold, italic, strikethrough, links,
- * headers (h1-h6), blockquotes, horizontal rules, unordered and ordered
- * lists, and basic pipe tables.
- */
-function markdownToHtml(text: string): string {
-  // --- Phase 1: Extract fenced code blocks to protect from further processing ---
-  const codeBlocks: string[] = [];
-  let html = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const langAttr = lang ? ` class="language-${lang}"` : '';
-    const placeholder = `\x00CODEBLOCK${codeBlocks.length}\x00`;
-    codeBlocks.push(`<pre><code${langAttr}>${escaped}</code></pre>`);
-    return placeholder;
-  });
-
-  // --- Phase 2: Process block-level elements line by line ---
-  const lines = html.split('\n');
-  const result: string[] = [];
-  let inList: 'ul' | 'ol' | null = null;
-  let inBlockquote = false;
-  let inTable = false;
-  let tableRows: string[] = [];
-
-  const flushTable = () => {
-    if (tableRows.length === 0) return;
-    const headerRow = tableRows[0];
-    const dataRows = tableRows.slice(1).filter(r => !r.match(/^\s*\|[\s:|-]+\|\s*$/));
-    let tableHtml = '<table><thead><tr>';
-    const headerCells = headerRow.split('|').map(c => c.trim()).filter(c => c);
-    for (const cell of headerCells) tableHtml += `<th>${cell}</th>`;
-    tableHtml += '</tr></thead>';
-    if (dataRows.length > 0) {
-      tableHtml += '<tbody>';
-      for (const row of dataRows) {
-        const cells = row.split('|').map(c => c.trim()).filter(c => c);
-        tableHtml += '<tr>';
-        for (const cell of cells) tableHtml += `<td>${cell}</td>`;
-        tableHtml += '</tr>';
-      }
-      tableHtml += '</tbody>';
-    }
-    tableHtml += '</table>';
-    result.push(tableHtml);
-    tableRows = [];
-    inTable = false;
-  };
-
-  const flushList = () => {
-    if (inList) {
-      result.push(inList === 'ul' ? '</ul>' : '</ol>');
-      inList = null;
-    }
-  };
-
-  const flushBlockquote = () => {
-    if (inBlockquote) {
-      result.push('</blockquote>');
-      inBlockquote = false;
-    }
-  };
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Code block placeholder — pass through as-is
-    if (line.match(/\x00CODEBLOCK\d+\x00/)) {
-      flushList();
-      flushBlockquote();
-      flushTable();
-      result.push(line);
-      continue;
-    }
-
-    // Table rows (starts and ends with |)
-    if (line.match(/^\s*\|.*\|\s*$/)) {
-      flushList();
-      flushBlockquote();
-      inTable = true;
-      tableRows.push(line);
-      continue;
-    } else if (inTable) {
-      flushTable();
-    }
-
-    // Horizontal rule
-    if (line.match(/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/)) {
-      flushList();
-      flushBlockquote();
-      result.push('<hr>');
-      continue;
-    }
-
-    // Headers
-    const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
-    if (headerMatch) {
-      flushList();
-      flushBlockquote();
-      const level = headerMatch[1].length;
-      result.push(`<h${level}>${headerMatch[2]}</h${level}>`);
-      continue;
-    }
-
-    // Blockquotes
-    if (line.match(/^>\s?/)) {
-      flushList();
-      if (!inBlockquote) {
-        result.push('<blockquote>');
-        inBlockquote = true;
-      }
-      result.push(line.replace(/^>\s?/, '') + '<br>');
-      continue;
-    } else if (inBlockquote) {
-      flushBlockquote();
-    }
-
-    // Unordered list items
-    if (line.match(/^\s*[-*+]\s+/)) {
-      flushBlockquote();
-      if (inList !== 'ul') {
-        flushList();
-        result.push('<ul>');
-        inList = 'ul';
-      }
-      result.push(`<li>${line.replace(/^\s*[-*+]\s+/, '')}</li>`);
-      continue;
-    }
-
-    // Ordered list items
-    const olMatch = line.match(/^\s*(\d+)[.)]\s+/);
-    if (olMatch) {
-      flushBlockquote();
-      if (inList !== 'ol') {
-        flushList();
-        result.push('<ol>');
-        inList = 'ol';
-      }
-      result.push(`<li>${line.replace(/^\s*\d+[.)]\s+/, '')}</li>`);
-      continue;
-    }
-
-    // Blank line inside a list — peek ahead to see if the list continues
-    if (inList && line.trim() === '') {
-      const next = lines.slice(i + 1).find(l => l.trim() !== '');
-      const listContinues = next !== undefined && (
-        (inList === 'ol' && /^\s*\d+[.)]\s+/.test(next)) ||
-        (inList === 'ul' && /^\s*[-*+]\s+/.test(next))
-      );
-      if (listContinues) continue; // skip blank line, keep list open
-      flushList();
-      result.push('<br>');
-      continue;
-    }
-    flushList();
-
-    // Empty line
-    if (line.trim() === '') {
-      result.push('<br>');
-      continue;
-    }
-
-    result.push(line + '<br>');
-  }
-
-  flushList();
-  flushBlockquote();
-  flushTable();
-
-  html = result.join('\n');
-
-  // --- Phase 3: Inline formatting ---
-  // Inline code (before bold/italic to avoid conflicts)
-  html = html.replace(/`([^`]+)`/g, (_, code) => {
-    const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    return `<code>${escaped}</code>`;
-  });
-
-  // Bold (** or __)
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  // __ bold only at word boundaries — avoid matching snake_case__names
-  html = html.replace(/(?<=^|[\s(>])__(?=\S)([\s\S]+?\S)__(?=$|[\s)<.,;:!?])/gm, '<strong>$1</strong>');
-
-  // Italic (* or _)
-  html = html.replace(/(?<!\*)\*([^*]+?)\*(?!\*)/g, '<em>$1</em>');
-  // _ italic only at word boundaries — avoid matching snake_case_names, file_paths, etc.
-  html = html.replace(/(?<=^|[\s(>])_(?=\S)([^_]+?\S)_(?=$|[\s)<.,;:!?])/gm, '<em>$1</em>');
-
-  // Strikethrough
-  html = html.replace(/~~(.+?)~~/g, '<del>$1</del>');
-
-  // Links
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-
-  // --- Phase 4: Restore code blocks ---
-  for (let i = 0; i < codeBlocks.length; i++) {
-    html = html.replace(`\x00CODEBLOCK${i}\x00`, codeBlocks[i]);
-  }
-
-  return html;
-}
-
 function formatPairingMsg(code: string): string {
   return `Hi! This bot requires pairing.\n\nYour pairing code: **${code}**\n\nAsk the bot owner to approve with:\n\`lettabot pairing approve matrix ${code}\``;
 }
-
-type MatrixClient = {
-  start(): Promise<void>;
-  stop(): void;
-  sendMessage(roomId: string, content: Record<string, unknown>): Promise<string>;
-  sendEvent(roomId: string, eventType: string, content: Record<string, unknown>): Promise<string>;
-  setTyping(roomId: string, isTyping: boolean, timeoutMs?: number): Promise<void>;
-  uploadContent(data: Buffer, opts?: { name?: string; type?: string }): Promise<string>;
-  getJoinedRoomMembers(roomId: string): Promise<string[]>;
-  getRoomStateEvent(roomId: string, eventType: string, stateKey: string): Promise<Record<string, unknown>>;
-  on(event: string, handler: (...args: unknown[]) => void): void;
-};
 
 export class MatrixAdapter implements ChannelAdapter {
   readonly id = 'matrix' as const;
   readonly name = 'Matrix';
 
-  private client: MatrixClient | null = null;
+  private client: import('matrix-js-sdk').MatrixClient | null = null;
   private config: MatrixAdapterConfig;
   private running = false;
   private roomMemberCache: Map<string, number> = new Map();
@@ -309,115 +98,151 @@ export class MatrixAdapter implements ChannelAdapter {
   onCommand?: (command: string, chatId?: string, args?: string, forcePerChat?: boolean) => Promise<string | null>;
 
   constructor(config: MatrixAdapterConfig) {
-    this.config = {
-      ...config,
-      dmPolicy: config.dmPolicy || 'pairing',
-    };
+    this.config = config;
   }
 
   private async checkAccess(userId: string): Promise<'allowed' | 'blocked' | 'pairing'> {
-    return checkDmAccess('matrix', userId, this.config.dmPolicy as DmPolicy, this.config.allowedUsers);
+    return checkDmAccess('matrix', userId, this.config.dmPolicy, this.config.allowedUsers);
   }
 
-  private async isRoomDm(roomId: string): Promise<boolean> {
+  /**
+   * Check if a room is a DM (≤2 members). Uses cached member count.
+   */
+  private isRoomDm(roomId: string): boolean {
     if (this.roomMemberCache.has(roomId)) {
       return this.roomMemberCache.get(roomId)! <= 2;
     }
-    try {
-      const members = await this.client!.getJoinedRoomMembers(roomId);
-      const count = members.length;
-      this.roomMemberCache.set(roomId, count);
-      return count <= 2;
-    } catch (err) {
-      log.warn('Failed to get room members for %s: %s', roomId, err);
-      return true; // Default to DM for safety
-    }
+
+    if (!this.client) return false;
+
+    const room = this.client.getRoom(roomId);
+    if (!room) return false;
+
+    const members = room.getJoinedMembers();
+    const count = members.length;
+    this.roomMemberCache.set(roomId, count);
+    return count <= 2;
   }
 
-  private async getRoomName(roomId: string): Promise<string | undefined> {
+  private getRoomName(roomId: string): string | undefined {
     if (this.roomNameCache.has(roomId)) {
       return this.roomNameCache.get(roomId);
     }
-    try {
-      const nameEvent = await this.client!.getRoomStateEvent(roomId, 'm.room.name', '');
-      const name = nameEvent?.['name'] as string | undefined;
-      if (name) {
-        this.roomNameCache.set(roomId, name);
-        return name;
-      }
-    } catch {
-      // Room may not have a name set
+
+    if (!this.client) return undefined;
+
+    const room = this.client.getRoom(roomId);
+    if (!room) return undefined;
+
+    const nameEvent = room.currentState.getStateEvents('m.room.name', '');
+    const name = nameEvent?.getContent()?.name as string | undefined;
+    if (name) {
+      this.roomNameCache.set(roomId, name);
+      return name;
     }
+
     return undefined;
   }
 
   async start(): Promise<void> {
     if (this.running) return;
 
-    log.info('Loading matrix-bot-sdk...');
-    const sdk = await import('matrix-bot-sdk') as unknown as {
-      SimpleFsStorageProvider: new (path: string) => unknown;
-      MatrixClient: new (url: string, token: string, storage: unknown) => MatrixClient & { on(e: string, h: (...a: unknown[]) => void): void };
-      AutojoinRoomsMixin: { setupOnClient(client: unknown): void };
-    };
+    log.info('Loading matrix-js-sdk...');
+
+    // IndexedDB polyfill required for rust crypto in Node.js
+    await import('fake-indexeddb/auto');
+
+    const sdk = await import('matrix-js-sdk');
 
     const storePath = this.config.storePath || './data/matrix-store';
     log.info(`Storage path: ${storePath}`);
-    const storage = new sdk.SimpleFsStorageProvider(storePath);
 
-    const matrixClient = new sdk.MatrixClient(
-      this.config.homeserverUrl,
-      this.config.accessToken,
-      storage,
-    );
+    const clientOpts: Parameters<typeof sdk.createClient>[0] = {
+      baseUrl: this.config.homeserverUrl,
+      accessToken: this.config.accessToken,
+      userId: this.config.userId,
+      deviceId: this.config.deviceId,
+    };
 
-    sdk.AutojoinRoomsMixin.setupOnClient(matrixClient);
-    log.info('AutojoinRoomsMixin enabled');
+    if (this.config.e2ee) {
+      clientOpts.cryptoCallbacks = getCryptoCallbacks(this.config.recoveryKey);
+    }
 
-    this.client = matrixClient as unknown as MatrixClient;
+    const matrixClient = sdk.createClient(clientOpts);
+    this.client = matrixClient;
 
-    // Listen for messages
-    matrixClient.on('room.message', ((...args: unknown[]) => {
-      const [roomId, event] = args as [string, Record<string, unknown>];
-      this.handleRoomMessage(roomId, event).catch((err) => {
-        log.error('Error handling room.message:', err);
+    // Initialize E2EE before starting the client
+    if (this.config.e2ee) {
+      await initE2EE(matrixClient, {
+        enableEncryption: true,
+        recoveryKey: this.config.recoveryKey,
+        storeDir: storePath,
+        userId: this.config.userId,
       });
-    }) as (...args: unknown[]) => void);
+    }
 
-    // Handle room events: cache invalidation + inbound reactions
-    matrixClient.on('room.event', ((...args: unknown[]) => {
-      const [roomId, event] = args as [string, Record<string, unknown>];
-      if (event['type'] === 'm.room.member') {
-        this.roomMemberCache.delete(roomId);
+    // Auto-join on invite (replaces matrix-bot-sdk's AutojoinRoomsMixin)
+    matrixClient.on(sdk.RoomEvent.MyMembership, (room, membership) => {
+      if (membership === sdk.KnownMembership.Invite) {
+        matrixClient.joinRoom(room.roomId).then(() => {
+          log.info(`Auto-joined room ${room.roomId}`);
+          this.handleRoomJoin(room.roomId).catch((err) => {
+            log.error('Error handling room.join:', err);
+          });
+        }).catch((err) => {
+          log.error(`Failed to auto-join room ${room.roomId}:`, err);
+        });
       }
-      if (event['type'] === 'm.room.name') {
-        this.roomNameCache.delete(roomId);
-      }
-      if (event['type'] === 'm.reaction') {
+    });
+    log.info('Auto-join on invite enabled');
+
+    // Listen for timeline events (messages, reactions, state changes)
+    matrixClient.on(sdk.RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
+      // Skip historical events loaded during initial sync
+      if (toStartOfTimeline) return;
+
+      const eventType = event.getType();
+      const roomId = event.getRoomId();
+      if (!roomId) return;
+
+      if (eventType === 'm.room.message') {
+        this.handleRoomMessage(roomId, event).catch((err) => {
+          log.error('Error handling room.message:', err);
+        });
+      } else if (eventType === 'm.reaction') {
         this.handleReaction(roomId, event).catch((err) => {
           log.error('Error handling m.reaction:', err);
         });
+      } else if (eventType === 'm.room.member') {
+        this.roomMemberCache.delete(roomId);
+      } else if (eventType === 'm.room.name') {
+        this.roomNameCache.delete(roomId);
       }
-    }) as (...args: unknown[]) => void);
-
-    // Auto-approve groups when a paired user invites the bot (mirrors Telegram behavior)
-    matrixClient.on('room.join', ((...args: unknown[]) => {
-      const [roomId, event] = args as [string, Record<string, unknown>];
-      this.handleRoomJoin(roomId, event).catch((err) => {
-        log.error('Error handling room.join:', err);
-      });
-    }) as (...args: unknown[]) => void);
+    });
 
     log.info(`Connecting to Matrix homeserver at ${this.config.homeserverUrl}...`);
     try {
-      await matrixClient.start();
+      await matrixClient.startClient({ initialSyncLimit: 10 });
     } catch (err) {
-      log.error('matrix-bot-sdk start() failed:', err);
+      log.error('matrix-js-sdk startClient() failed:', err);
       throw err;
     }
+
+    // After first sync, restore key backup if E2EE is enabled
+    if (this.config.e2ee) {
+      matrixClient.once(sdk.ClientEvent.Sync, (state: string) => {
+        if (state === 'PREPARED') {
+          checkAndRestoreKeyBackup(matrixClient, this.config.recoveryKey).catch((err) => {
+            log.error('Key backup restore failed:', err);
+          });
+        }
+      });
+    }
+
     this.running = true;
     log.info(`Matrix adapter started as ${this.config.userId}`);
     log.info(`DM policy: ${this.config.dmPolicy}`);
+    log.info(`E2EE: ${this.config.e2ee ? 'enabled' : 'disabled'}`);
     if (this.config.groups && Object.keys(this.config.groups).length > 0) {
       log.info(`Configured groups: ${Object.keys(this.config.groups).join(', ')}`);
     }
@@ -428,7 +253,7 @@ export class MatrixAdapter implements ChannelAdapter {
 
   async stop(): Promise<void> {
     if (!this.running || !this.client) return;
-    this.client.stop();
+    this.client.stopClient();
     this.running = false;
     log.info('Matrix adapter stopped');
   }
@@ -441,8 +266,8 @@ export class MatrixAdapter implements ChannelAdapter {
    * Handle the bot joining a room — auto-approve groups when a paired user invites.
    * Mirrors Telegram's my_chat_member handler.
    */
-  private async handleRoomJoin(roomId: string, _event: Record<string, unknown>): Promise<void> {
-    const isDm = await this.isRoomDm(roomId);
+  private async handleRoomJoin(roomId: string): Promise<void> {
+    const isDm = this.isRoomDm(roomId);
     if (isDm) return; // DM rooms don't need group approval
 
     const dmPolicy = this.config.dmPolicy || 'pairing';
@@ -453,17 +278,17 @@ export class MatrixAdapter implements ChannelAdapter {
     }
 
     // Try to identify who invited the bot by checking room members
-    // In most cases the inviter is the other member already in the room
     try {
-      const members = await this.client!.getJoinedRoomMembers(roomId);
-      const otherMembers = members.filter(m => m !== this.config.userId);
+      const room = this.client!.getRoom(roomId);
+      const members = room?.getJoinedMembers() || [];
+      const otherMembers = members.filter(m => m.userId !== this.config.userId);
       const configAllowlist = this.config.allowedUsers;
 
-      for (const memberId of otherMembers) {
-        const allowed = await isUserAllowed('matrix', memberId, configAllowlist);
+      for (const member of otherMembers) {
+        const allowed = await isUserAllowed('matrix', member.userId, configAllowlist);
         if (allowed) {
           await approveGroup('matrix', roomId);
-          log.info(`Group ${roomId} approved by paired user ${memberId}`);
+          log.info(`Group ${roomId} approved by paired user ${member.userId}`);
           return;
         }
       }
@@ -476,11 +301,11 @@ export class MatrixAdapter implements ChannelAdapter {
   /**
    * Handle inbound m.reaction events — mirrors Telegram's message_reaction handler.
    */
-  private async handleReaction(roomId: string, event: Record<string, unknown>): Promise<void> {
-    const sender = event['sender'] as string | undefined;
+  private async handleReaction(roomId: string, event: import('matrix-js-sdk').MatrixEvent): Promise<void> {
+    const sender = event.getSender();
     if (!sender || sender === this.config.userId) return;
 
-    const content = event['content'] as Record<string, unknown> | undefined;
+    const content = event.getContent();
     if (!content) return;
 
     const relatesTo = content['m.relates_to'] as Record<string, unknown> | undefined;
@@ -491,7 +316,7 @@ export class MatrixAdapter implements ChannelAdapter {
     if (!targetEventId || !emoji) return;
 
     // DM access check
-    const isDm = await this.isRoomDm(roomId);
+    const isDm = this.isRoomDm(roomId);
     if (isDm) {
       const access = await this.checkAccess(sender);
       if (access !== 'allowed') return;
@@ -501,8 +326,6 @@ export class MatrixAdapter implements ChannelAdapter {
 
     if (!this.onMessage) return;
 
-    // Matrix doesn't distinguish add/remove in the event itself — reactions are always "added"
-    // (redactions handle removal, which is a separate event type)
     const reaction: InboundReaction = {
       emoji,
       messageId: targetEventId,
@@ -522,22 +345,21 @@ export class MatrixAdapter implements ChannelAdapter {
     });
   }
 
-  private async handleRoomMessage(roomId: string, event: Record<string, unknown>): Promise<void> {
-    const sender = event['sender'] as string | undefined;
+  private async handleRoomMessage(roomId: string, event: import('matrix-js-sdk').MatrixEvent): Promise<void> {
+    const sender = event.getSender();
     if (!sender || sender === this.config.userId) return;
 
-    const content = event['content'] as Record<string, unknown> | undefined;
+    const content = event.getContent();
     if (!content) return;
 
     const msgtype = content['msgtype'] as string | undefined;
     if (!msgtype) return;
 
-    const eventId = event['event_id'] as string | undefined;
-    const originServerTs = event['origin_server_ts'] as number | undefined;
-    const timestamp = originServerTs ? new Date(originServerTs) : new Date();
+    const eventId = event.getId();
+    const timestamp = new Date(event.getTs());
     const body = (content['body'] as string | undefined) || '';
 
-    const isDm = await this.isRoomDm(roomId);
+    const isDm = this.isRoomDm(roomId);
     const isGroup = !isDm;
 
     log.info(`Message from ${sender} in ${isDm ? 'DM' : 'group'} ${roomId} (type: ${msgtype})`);
@@ -555,10 +377,8 @@ export class MatrixAdapter implements ChannelAdapter {
       const access = await this.checkAccess(sender);
       log.info(`DM access check for ${sender}: ${access}`);
       if (access === 'blocked') {
-        await this.client!.sendMessage(roomId, {
-          msgtype: 'm.text',
-          body: "Sorry, you're not authorized to use this bot.",
-        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await this.client!.sendMessage(roomId, { msgtype: 'm.text', body: "Sorry, you're not authorized to use this bot." } as any);
         return;
       }
       if (access === 'pairing') {
@@ -566,10 +386,8 @@ export class MatrixAdapter implements ChannelAdapter {
           username: sender,
         });
         if (!code) {
-          await this.client!.sendMessage(roomId, {
-            msgtype: 'm.text',
-            body: 'Too many pending pairing requests. Please try again later.',
-          });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await this.client!.sendMessage(roomId, { msgtype: 'm.text', body: 'Too many pending pairing requests. Please try again later.' } as any);
           return;
         }
         if (created) {
@@ -581,7 +399,7 @@ export class MatrixAdapter implements ChannelAdapter {
           body: pairingText,
           format: 'org.matrix.custom.html',
           formatted_body: markdownToHtml(pairingText),
-        });
+        } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
         return;
       }
     }
@@ -592,7 +410,7 @@ export class MatrixAdapter implements ChannelAdapter {
 
     // Group gating
     if (isGroup) {
-      groupName = await this.getRoomName(roomId);
+      groupName = this.getRoomName(roomId);
 
       if (this.config.groups) {
         const keys = [roomId];
@@ -633,30 +451,24 @@ export class MatrixAdapter implements ChannelAdapter {
       if (command && KNOWN_MATRIX_COMMANDS.has(command)) {
         log.info(`Command: /${command}${cmdArgs ? ` ${cmdArgs}` : ''} from ${sender}`);
         if (command === 'help' || command === 'start') {
-          await this.client!.sendMessage(roomId, {
-            msgtype: 'm.text',
-            body: HELP_TEXT,
-          });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await this.client!.sendMessage(roomId, { msgtype: 'm.text', body: HELP_TEXT } as any);
           return;
         }
 
         if (this.onCommand) {
           const result = await this.onCommand(command, roomId, cmdArgs);
           if (result) {
-            await this.client!.sendMessage(roomId, {
-              msgtype: 'm.text',
-              body: result,
-            });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            await this.client!.sendMessage(roomId, { msgtype: 'm.text', body: result } as any);
           }
           return;
         }
       } else if (command) {
         // Unknown command — send feedback (mirrors Telegram behavior)
         log.info(`Unknown command: /${command} from ${sender}`);
-        await this.client!.sendMessage(roomId, {
-          msgtype: 'm.text',
-          body: `Unknown command: /${command}\nTry /help.`,
-        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await this.client!.sendMessage(roomId, { msgtype: 'm.text', body: `Unknown command: /${command}\nTry /help.` } as any);
         return;
       }
     }
@@ -772,10 +584,8 @@ export class MatrixAdapter implements ChannelAdapter {
     const { isTranscriptionConfigured } = await import('../transcription/index.js');
     if (!isTranscriptionConfigured()) {
       log.info('Voice message received but transcription not configured');
-      await this.client!.sendMessage(roomId, {
-        msgtype: 'm.text',
-        body: 'Voice messages require a transcription API key.',
-      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await this.client!.sendMessage(roomId, { msgtype: 'm.text', body: 'Voice messages require a transcription API key.' } as any);
       return '';
     }
 
@@ -816,13 +626,13 @@ export class MatrixAdapter implements ChannelAdapter {
       const plainBody = msg.parseMode === 'HTML'
         ? chunk.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
         : chunk;
-      const eventId = await this.client.sendMessage(msg.chatId, {
+      const resp = await this.client.sendMessage(msg.chatId, {
         msgtype: 'm.text',
         body: plainBody,
         format: 'org.matrix.custom.html',
         formatted_body: htmlBody,
-      });
-      lastEventId = eventId;
+      } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+      lastEventId = resp.event_id;
     }
 
     return { messageId: lastEventId };
@@ -834,19 +644,20 @@ export class MatrixAdapter implements ChannelAdapter {
     const fileName = basename(file.filePath);
     log.info(`Sending file "${fileName}" (${file.kind}) to ${file.chatId}`);
     const buffer = await readFile(file.filePath);
-    const mxcUrl = await this.client.uploadContent(buffer, { name: fileName });
+    const uploadResp = await this.client.uploadContent(buffer, { name: fileName });
+    const mxcUrl = uploadResp.content_uri;
 
     const msgtype =
       file.kind === 'image' ? 'm.image' :
       file.kind === 'audio' ? 'm.audio' : 'm.file';
 
-    const eventId = await this.client.sendMessage(file.chatId, {
+    const resp = await this.client.sendMessage(file.chatId, {
       msgtype,
       body: file.caption || fileName,
       url: mxcUrl,
-    });
+    } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
 
-    return { messageId: eventId };
+    return { messageId: resp.event_id };
   }
 
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
@@ -869,14 +680,15 @@ export class MatrixAdapter implements ChannelAdapter {
         rel_type: 'm.replace',
         event_id: messageId,
       },
-    });
+    } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
   }
 
   async addReaction(chatId: string, messageId: string, emoji: string): Promise<void> {
     if (!this.client) throw new Error('Matrix adapter not started');
 
     const resolved = resolveEmoji(emoji);
-    await this.client.sendEvent(chatId, 'm.reaction', {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await this.client.sendEvent(chatId, 'm.reaction' as any, {
       'm.relates_to': {
         rel_type: 'm.annotation',
         event_id: messageId,
@@ -888,7 +700,7 @@ export class MatrixAdapter implements ChannelAdapter {
   async sendTypingIndicator(chatId: string): Promise<void> {
     if (!this.client) return;
     try {
-      await this.client.setTyping(chatId, true, 5000);
+      await this.client.sendTyping(chatId, true, 5000);
     } catch {
       // Ignore typing failures
     }
@@ -897,7 +709,7 @@ export class MatrixAdapter implements ChannelAdapter {
   async stopTypingIndicator(chatId: string): Promise<void> {
     if (!this.client) return;
     try {
-      await this.client.setTyping(chatId, false);
+      await this.client.sendTyping(chatId, false, 0);
     } catch {
       // Ignore typing failures
     }
