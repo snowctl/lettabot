@@ -20,6 +20,7 @@ export const CHANNELS = [
   { id: 'whatsapp', displayName: 'WhatsApp', hint: 'QR code pairing' },
   { id: 'signal', displayName: 'Signal', hint: 'signal-cli daemon' },
   { id: 'bluesky', displayName: 'Bluesky', hint: 'Jetstream feed (read-only)' },
+  { id: 'matrix', displayName: 'Matrix', hint: 'Homeserver + access token' },
 ] as const;
 
 export type ChannelId = typeof CHANNELS[number]['id'];
@@ -30,6 +31,15 @@ export function getChannelMeta(id: ChannelId) {
 
 export function isSignalCliInstalled(): boolean {
   return spawnSync('which', ['signal-cli'], { stdio: 'pipe' }).status === 0;
+}
+
+async function promptStreaming(existing?: any): Promise<boolean | undefined> {
+  const streaming = await p.confirm({
+    message: 'Stream responses? (progressively edit message as it generates)',
+    initialValue: existing?.streaming ?? false,
+  });
+  if (p.isCancel(streaming)) return undefined;
+  return streaming;
 }
 
 export function getChannelHint(id: ChannelId): string {
@@ -60,6 +70,9 @@ const GROUP_ID_HINTS: Record<ChannelId, string> = {
     'Group IDs appear in bot logs on first group message.',
   bluesky:
     'Bluesky does not support groups. This setting is not used.',
+  matrix:
+    'Room IDs look like !abc123:matrix.org.\n' +
+    'Find them in room settings or bot logs on first message.',
 };
 
 // ============================================================================
@@ -233,12 +246,14 @@ export async function setupTelegram(existing?: any): Promise<any> {
   }
   
   const groupSettings = await promptGroupSettings('telegram', existing);
+  const streaming = await promptStreaming(existing);
 
   return {
     enabled: true,
     token: token || undefined,
     dmPolicy: dmPolicy as 'pairing' | 'allowlist' | 'open',
     allowedUsers,
+    ...(streaming !== undefined ? { streaming } : {}),
     ...groupSettings,
   };
 }
@@ -277,11 +292,13 @@ export async function setupSlack(existing?: any): Promise<any> {
     
     if (result) {
       const groupSettings = await promptGroupSettings('slack', existing);
+      const streaming = await promptStreaming(existing);
       return {
         enabled: true,
         appToken: result.appToken,
         botToken: result.botToken,
         allowedUsers: result.allowedUsers,
+        ...(streaming !== undefined ? { streaming } : {}),
         ...groupSettings,
       };
     }
@@ -327,12 +344,14 @@ export async function setupSlack(existing?: any): Promise<any> {
   
   const allowedUsers = await stepAccessControl(existing?.allowedUsers);
   const groupSettings = await promptGroupSettings('slack', existing);
-  
+  const streaming = await promptStreaming(existing);
+
   return {
     enabled: true,
     appToken: appToken || undefined,
     botToken: botToken || undefined,
     allowedUsers,
+    ...(streaming !== undefined ? { streaming } : {}),
     ...groupSettings,
   };
 }
@@ -406,12 +425,14 @@ export async function setupDiscord(existing?: any): Promise<any> {
   }
   
   const groupSettings = await promptGroupSettings('discord', existing);
+  const streaming = await promptStreaming(existing);
 
   return {
     enabled: true,
     token: token || undefined,
     dmPolicy: dmPolicy as 'pairing' | 'allowlist' | 'open',
     allowedUsers,
+    ...(streaming !== undefined ? { streaming } : {}),
     ...groupSettings,
   };
 }
@@ -718,6 +739,66 @@ export async function setupBluesky(existing?: BlueskyConfig): Promise<BlueskyCon
   };
 }
 
+export async function setupMatrix(existing?: any): Promise<any> {
+  const homeserverUrl = await p.text({
+    message: 'Matrix homeserver URL',
+    placeholder: 'https://matrix.org',
+    initialValue: existing?.homeserverUrl || 'https://matrix.org',
+    validate: (v) => !v.trim() ? 'Homeserver URL is required' : undefined,
+  });
+  if (p.isCancel(homeserverUrl)) {
+    p.cancel('Cancelled');
+    process.exit(0);
+  }
+
+  const userId = await p.text({
+    message: 'Bot user ID',
+    placeholder: '@bot:matrix.org',
+    initialValue: existing?.userId || '',
+    validate: (v) => !v.trim() ? 'User ID is required' : undefined,
+  });
+  if (p.isCancel(userId)) {
+    p.cancel('Cancelled');
+    process.exit(0);
+  }
+
+  const accessToken = await p.text({
+    message: 'Access token',
+    placeholder: 'syt_...',
+    initialValue: existing?.accessToken || '',
+    validate: (v) => !v.trim() ? 'Access token is required' : undefined,
+  });
+  if (p.isCancel(accessToken)) {
+    p.cancel('Cancelled');
+    process.exit(0);
+  }
+
+  const dmPolicy = await p.select({
+    message: 'DM access policy',
+    initialValue: existing?.dmPolicy || 'pairing',
+    options: [
+      { value: 'pairing', label: 'Pairing', hint: 'Users must be approved (default)' },
+      { value: 'allowlist', label: 'Allowlist', hint: 'Only listed users can interact' },
+      { value: 'open', label: 'Open', hint: 'Anyone can message' },
+    ],
+  });
+  if (p.isCancel(dmPolicy)) {
+    p.cancel('Cancelled');
+    process.exit(0);
+  }
+
+  const streaming = await promptStreaming(existing);
+
+  return {
+    enabled: true,
+    homeserverUrl: (homeserverUrl as string).trim(),
+    userId: (userId as string).trim(),
+    accessToken: (accessToken as string).trim(),
+    dmPolicy,
+    ...(streaming !== undefined ? { streaming } : {}),
+  };
+}
+
 /** Get the setup function for a channel */
 export function getSetupFunction(id: ChannelId): (existing?: any) => Promise<any> {
   const setupFunctions: Record<ChannelId, (existing?: any) => Promise<any>> = {
@@ -727,6 +808,7 @@ export function getSetupFunction(id: ChannelId): (existing?: any) => Promise<any
     whatsapp: setupWhatsApp,
     signal: setupSignal,
     bluesky: setupBluesky,
+    matrix: setupMatrix,
   };
   return setupFunctions[id];
 }

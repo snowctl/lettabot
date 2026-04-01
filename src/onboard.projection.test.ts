@@ -62,6 +62,9 @@ describe('onboarding projection helpers', () => {
         instantGroups: ['sg1'],
         listeningGroups: ['sg2'],
       },
+      matrix: {
+        enabled: false,
+      },
     };
 
     const interactive: any = {
@@ -117,6 +120,9 @@ describe('onboarding projection helpers', () => {
         groupPollIntervalMin: 6,
         instantGroups: ['sg1'],
         listeningGroups: ['sg2'],
+      },
+      matrix: {
+        enabled: false,
       },
       cron: false,
       heartbeat: { enabled: false, interval: '60' },

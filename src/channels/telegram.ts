@@ -36,6 +36,10 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   'approve',
   'disapprove',
   'setconv',
+  'models',
+  'breakglass',
+  'recompile',
+  'palace',
   'help',
   'start',
 ]);
@@ -337,6 +341,22 @@ export class TelegramAdapter implements ChannelAdapter {
       }
     });
 
+    // Handle /models
+    this.bot.command('models', async (ctx) => {
+      if (this.onCommand) {
+        const result = await this.onCommand('models', String(ctx.chat.id));
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'No models available',
+          replyToMessageId,
+        });
+      }
+    });
+
     // Handle /setconv <id>
     this.bot.command('setconv', async (ctx) => {
       if (this.onCommand) {
@@ -373,6 +393,55 @@ export class TelegramAdapter implements ChannelAdapter {
         }
       });
     }
+
+    // Handle /breakglass [agent]
+    this.bot.command('breakglass', async (ctx) => {
+      if (this.onCommand) {
+        const args = ctx.match?.trim() || undefined;
+        const result = await this.onCommand('breakglass', String(ctx.chat.id), args);
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'Break-glass complete',
+          replyToMessageId,
+        });
+      }
+    });
+
+    // Handle /recompile
+    this.bot.command('recompile', async (ctx) => {
+      if (this.onCommand) {
+        const result = await this.onCommand('recompile', String(ctx.chat.id));
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'Recompile complete',
+          replyToMessageId,
+        });
+      }
+    });
+
+    // Handle /palace
+    this.bot.command('palace', async (ctx) => {
+      if (this.onCommand) {
+        const result = await this.onCommand('palace', String(ctx.chat.id));
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'No memory blocks found.',
+          replyToMessageId,
+        });
+      }
+    });
 
     // Handle text messages
     this.bot.on('message:text', async (ctx) => {

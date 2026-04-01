@@ -216,6 +216,30 @@ export async function agentExists(agentId: string): Promise<boolean> {
 }
 
 /**
+ * Get an agent's core memory blocks.
+ */
+export async function getAgentMemoryBlocks(agentId: string): Promise<Array<{ label: string; value: string; description?: string | null; limit?: number }>> {
+  try {
+    const client = getClient();
+    const blocks: Array<{ label: string; value: string; description?: string | null; limit?: number }> = [];
+    for await (const block of client.agents.blocks.list(agentId)) {
+      if (block.label && typeof block.value === 'string') {
+        blocks.push({
+          label: block.label,
+          value: block.value,
+          description: block.description,
+          limit: block.limit,
+        });
+      }
+    }
+    return blocks;
+  } catch (e) {
+    log.error('Failed to get agent memory blocks:', e);
+    return [];
+  }
+}
+
+/**
  * Get an agent's current model handle
  */
 export async function getAgentModel(agentId: string): Promise<string | null> {
@@ -1084,5 +1108,74 @@ export async function disableAllToolApprovals(agentId: string): Promise<number> 
   } catch (e) {
     log.error('Failed to disable all tool approvals:', e);
     return 0;
+  }
+}
+
+/**
+ * Delete a conversation for an agent.
+ */
+export async function deleteConversation(agentId: string, conversationId: string): Promise<boolean> {
+  try {
+    const client = getClient();
+    await client.conversations.delete(conversationId);
+    log.info(`Deleted conversation ${conversationId} for agent ${agentId}`);
+    return true;
+  } catch (e) {
+    log.warn(`Failed to delete conversation ${conversationId} for agent ${agentId}:`, e);
+    return false;
+  }
+}
+
+/**
+ * Create a new conversation for an agent. Returns the new conversation ID.
+ */
+export async function createConversation(agentId: string): Promise<string | null> {
+  try {
+    const client = getClient();
+    const conversation = await client.conversations.create({ agent_id: agentId });
+    const convId = conversation.id ?? null;
+    if (convId) {
+      log.info(`Created new conversation ${convId} for agent ${agentId}`);
+    }
+    return convId;
+  } catch (e) {
+    log.error(`Failed to create conversation for agent ${agentId}:`, e);
+    return null;
+  }
+}
+
+/**
+ * Recompile a specific conversation's in-context messages, or the whole agent
+ * if no conversationId is provided.
+ */
+export async function recompileConversation(agentId: string, conversationId?: string | null): Promise<boolean> {
+  try {
+    const apiKey = process.env.LETTA_API_KEY || '';
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${apiKey}`,
+      'X-Letta-Source': 'lettabot',
+    };
+
+    const path = conversationId
+      ? `/v1/agents/${agentId}/conversations/${conversationId}/recompile`
+      : `/v1/agents/${agentId}/recompile`;
+
+    const resp = await fetch(`${LETTA_BASE_URL}${path}`, {
+      method: 'POST',
+      headers,
+    });
+
+    if (!resp.ok) {
+      log.error(`Recompile returned ${resp.status}: ${await resp.text()}`);
+      return false;
+    }
+
+    log.info(conversationId
+      ? `Recompiled conversation ${conversationId} for agent ${agentId}`
+      : `Recompiled agent ${agentId} (no conversation specified)`);
+    return true;
+  } catch (e) {
+    log.error(`Failed to recompile (agent=${agentId}, conv=${conversationId}):`, e);
+    return false;
   }
 }

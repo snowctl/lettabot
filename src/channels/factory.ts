@@ -1,5 +1,6 @@
 import { BlueskyAdapter } from './bluesky.js';
 import { DiscordAdapter } from './discord.js';
+import { MatrixAdapter } from './matrix.js';
 import { SignalAdapter } from './signal.js';
 import { SlackAdapter } from './slack.js';
 import { TelegramMTProtoAdapter } from './telegram-mtproto.js';
@@ -126,6 +127,32 @@ const SHARED_CHANNEL_BUILDERS: SharedChannelBuilder[] = [
       });
     },
   },
+  {
+    isEnabled: (agentConfig) => !!agentConfig.channels.matrix?.accessToken,
+    build: (agentConfig, options) => {
+      const matrix = agentConfig.channels.matrix;
+      if (!matrix?.homeserverUrl || !matrix.accessToken || !matrix.userId) {
+        throw new Error(`Matrix is enabled for agent "${agentConfig.name}" but credentials are missing`);
+      }
+      return new MatrixAdapter({
+        homeserverUrl: matrix.homeserverUrl,
+        accessToken: matrix.accessToken,
+        userId: matrix.userId,
+        deviceId: matrix.deviceId,
+        dmPolicy: matrix.dmPolicy || 'pairing',
+        allowedUsers: nonEmpty(matrix.allowedUsers),
+        streaming: matrix.streaming,
+        attachmentsDir: options.attachmentsDir,
+        attachmentsMaxBytes: options.attachmentsMaxBytes,
+        mentionPatterns: matrix.mentionPatterns,
+        groups: matrix.groups,
+        agentName: agentConfig.name,
+        e2ee: matrix.e2ee,
+        recoveryKey: matrix.recoveryKey,
+        storePath: matrix.storePath,
+      });
+    },
+  },
 ];
 
 /**
@@ -184,7 +211,9 @@ export function createChannelsForAgent(
 
   for (const builder of SHARED_CHANNEL_BUILDERS) {
     if (builder.isEnabled(agentConfig)) {
-      adapters.push(builder.build(agentConfig, sharedOptions));
+      const adapter = builder.build(agentConfig, sharedOptions);
+      log.info(`Created channel adapter: ${adapter.name} (${adapter.id})`);
+      adapters.push(adapter);
     }
   }
 

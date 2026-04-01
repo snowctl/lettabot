@@ -11,7 +11,7 @@ import type { AgentConfig, LettaBotConfig } from './config/types.js';
 import { isLettaApiUrl } from './utils/server.js';
 import { parseCsvList, parseOptionalInt } from './utils/parse.js';
 import { runChatgptConnect } from './commands/letta-connect.js';
-import { CHANNELS, getChannelHint, isSignalCliInstalled, setupTelegram, setupSlack, setupDiscord, setupWhatsApp, setupSignal } from './channels/setup.js';
+import { CHANNELS, getChannelHint, isSignalCliInstalled, setupTelegram, setupSlack, setupDiscord, setupWhatsApp, setupSignal, setupMatrix } from './channels/setup.js';
 
 // ============================================================================
 // Non-Interactive Helpers
@@ -123,6 +123,14 @@ function readConfigFromEnv(existingConfig: any): any {
       listeningGroups: parseOptionalCsvList(process.env.SIGNAL_LISTENING_GROUPS)
         ?? existingConfig.channels?.signal?.listeningGroups,
     },
+
+    matrix: {
+      enabled: !!process.env.MATRIX_ACCESS_TOKEN,
+      homeserverUrl: process.env.MATRIX_HOMESERVER_URL || existingConfig.channels?.matrix?.homeserverUrl || 'https://matrix.org',
+      userId: process.env.MATRIX_USER_ID || existingConfig.channels?.matrix?.userId,
+      accessToken: process.env.MATRIX_ACCESS_TOKEN || existingConfig.channels?.matrix?.accessToken,
+      dmPolicy: process.env.MATRIX_DM_POLICY || existingConfig.channels?.matrix?.dmPolicy || 'pairing',
+    },
   };
 }
 
@@ -178,6 +186,7 @@ interface OnboardConfig {
     enabled: boolean;
     token?: string;
     dmPolicy?: 'pairing' | 'allowlist' | 'open';
+    streaming?: boolean;
     allowedUsers?: string[];
     groupDebounceSec?: number;
     groupPollIntervalMin?: number;
@@ -188,6 +197,7 @@ interface OnboardConfig {
     enabled: boolean;
     appToken?: string;
     botToken?: string;
+    streaming?: boolean;
     allowedUsers?: string[];
     groupDebounceSec?: number;
     groupPollIntervalMin?: number;
@@ -219,19 +229,29 @@ interface OnboardConfig {
     enabled: boolean;
     token?: string;
     dmPolicy?: 'pairing' | 'allowlist' | 'open';
+    streaming?: boolean;
     allowedUsers?: string[];
     groupDebounceSec?: number;
     groupPollIntervalMin?: number;
     instantGroups?: string[];
     listeningGroups?: string[];
   };
-  
+  matrix: {
+    enabled: boolean;
+    homeserverUrl?: string;
+    userId?: string;
+    accessToken?: string;
+    dmPolicy?: 'pairing' | 'allowlist' | 'open';
+    streaming?: boolean;
+  };
+
   // Google Workspace (via gog CLI)
   google: { enabled: boolean; accounts: Array<{ account: string; services: string[] }> };
-  
+
   // Features
-  heartbeat: { enabled: boolean; interval?: string };
+  heartbeat: { enabled: boolean; interval?: string; intervalMax?: string };
   cron: boolean;
+  display: { showToolCalls: boolean; showReasoning: boolean };
 
   // Transcription (voice messages)
   transcription: { enabled: boolean; provider?: 'openai' | 'mistral'; apiKey?: string; model?: string };
@@ -291,6 +311,13 @@ type NonInteractiveProjectionSource = {
     instantGroups?: string[];
     listeningGroups?: string[];
   };
+  matrix: {
+    enabled: boolean;
+    homeserverUrl?: string;
+    userId?: string;
+    accessToken?: string;
+    dmPolicy?: 'pairing' | 'allowlist' | 'open';
+  };
 };
 
 export type AgentProjectionInput = {
@@ -300,6 +327,7 @@ export type AgentProjectionInput = {
     enabled: boolean;
     token?: string;
     dmPolicy?: 'pairing' | 'allowlist' | 'open';
+    streaming?: boolean;
     allowedUsers?: string[];
     groupDebounceSec?: number;
     groupPollIntervalMin?: number;
@@ -310,6 +338,7 @@ export type AgentProjectionInput = {
     enabled: boolean;
     appToken?: string;
     botToken?: string;
+    streaming?: boolean;
     allowedUsers?: string[];
     groupDebounceSec?: number;
     groupPollIntervalMin?: number;
@@ -320,6 +349,7 @@ export type AgentProjectionInput = {
     enabled: boolean;
     token?: string;
     dmPolicy?: 'pairing' | 'allowlist' | 'open';
+    streaming?: boolean;
     allowedUsers?: string[];
     groupDebounceSec?: number;
     groupPollIntervalMin?: number;
@@ -347,8 +377,17 @@ export type AgentProjectionInput = {
     instantGroups?: string[];
     listeningGroups?: string[];
   };
+  matrix: {
+    enabled: boolean;
+    homeserverUrl?: string;
+    userId?: string;
+    accessToken?: string;
+    dmPolicy?: 'pairing' | 'allowlist' | 'open';
+    streaming?: boolean;
+  };
   cronEnabled: boolean;
-  heartbeat: { enabled: boolean; intervalMin?: number };
+  heartbeat: { enabled: boolean; intervalMin?: number; intervalMaxMin?: number };
+  display?: { showToolCalls?: boolean; showReasoning?: boolean };
   google: { enabled: boolean; accounts: Array<{ account: string; services: string[] }> };
 };
 
@@ -407,6 +446,13 @@ export function toProjectionInputFromNonInteractiveConfig(config: NonInteractive
       instantGroups: config.signal.instantGroups,
       listeningGroups: config.signal.listeningGroups,
     },
+    matrix: {
+      enabled: config.matrix.enabled,
+      homeserverUrl: config.matrix.homeserverUrl,
+      userId: config.matrix.userId,
+      accessToken: config.matrix.accessToken,
+      dmPolicy: config.matrix.dmPolicy,
+    },
     cronEnabled: false,
     heartbeat: { enabled: false, intervalMin: 60 },
     google: { enabled: false, accounts: [] },
@@ -421,6 +467,7 @@ export function toProjectionInputFromOnboardConfig(config: OnboardConfig): Agent
       enabled: config.telegram.enabled,
       token: config.telegram.token,
       dmPolicy: config.telegram.dmPolicy,
+      streaming: config.telegram.streaming,
       allowedUsers: config.telegram.allowedUsers,
       groupDebounceSec: config.telegram.groupDebounceSec,
       groupPollIntervalMin: config.telegram.groupPollIntervalMin,
@@ -431,6 +478,7 @@ export function toProjectionInputFromOnboardConfig(config: OnboardConfig): Agent
       enabled: config.slack.enabled,
       appToken: config.slack.appToken,
       botToken: config.slack.botToken,
+      streaming: config.slack.streaming,
       allowedUsers: config.slack.allowedUsers,
       groupDebounceSec: config.slack.groupDebounceSec,
       groupPollIntervalMin: config.slack.groupPollIntervalMin,
@@ -441,6 +489,7 @@ export function toProjectionInputFromOnboardConfig(config: OnboardConfig): Agent
       enabled: config.discord.enabled,
       token: config.discord.token,
       dmPolicy: config.discord.dmPolicy,
+      streaming: config.discord.streaming,
       allowedUsers: config.discord.allowedUsers,
       groupDebounceSec: config.discord.groupDebounceSec,
       groupPollIntervalMin: config.discord.groupPollIntervalMin,
@@ -468,11 +517,21 @@ export function toProjectionInputFromOnboardConfig(config: OnboardConfig): Agent
       instantGroups: config.signal.instantGroups,
       listeningGroups: config.signal.listeningGroups,
     },
+    matrix: {
+      enabled: config.matrix.enabled,
+      homeserverUrl: config.matrix.homeserverUrl,
+      userId: config.matrix.userId,
+      accessToken: config.matrix.accessToken,
+      dmPolicy: config.matrix.dmPolicy,
+      streaming: config.matrix.streaming,
+    },
     cronEnabled: config.cron,
     heartbeat: {
       enabled: config.heartbeat.enabled,
       intervalMin: config.heartbeat.interval ? parseInt(config.heartbeat.interval, 10) : undefined,
+      intervalMaxMin: config.heartbeat.intervalMax ? parseInt(config.heartbeat.intervalMax, 10) : undefined,
     },
+    display: config.display,
     google: config.google,
   };
 }
@@ -487,6 +546,7 @@ export function buildProjectedAgentConfig(input: AgentProjectionInput): AgentCon
           enabled: true,
           token: input.telegram.token,
           dmPolicy: input.telegram.dmPolicy,
+          streaming: input.telegram.streaming,
           allowedUsers: input.telegram.allowedUsers,
           groupDebounceSec: input.telegram.groupDebounceSec,
           groupPollIntervalMin: input.telegram.groupPollIntervalMin,
@@ -499,6 +559,7 @@ export function buildProjectedAgentConfig(input: AgentProjectionInput): AgentCon
           enabled: true,
           appToken: input.slack.appToken,
           botToken: input.slack.botToken,
+          streaming: input.slack.streaming,
           allowedUsers: input.slack.allowedUsers,
           groupDebounceSec: input.slack.groupDebounceSec,
           groupPollIntervalMin: input.slack.groupPollIntervalMin,
@@ -511,6 +572,7 @@ export function buildProjectedAgentConfig(input: AgentProjectionInput): AgentCon
           enabled: true,
           token: input.discord.token,
           dmPolicy: input.discord.dmPolicy,
+          streaming: input.discord.streaming,
           allowedUsers: input.discord.allowedUsers,
           groupDebounceSec: input.discord.groupDebounceSec,
           groupPollIntervalMin: input.discord.groupPollIntervalMin,
@@ -543,13 +605,30 @@ export function buildProjectedAgentConfig(input: AgentProjectionInput): AgentCon
           listeningGroups: input.signal.listeningGroups,
         }
       } : {}),
+      ...(input.matrix.enabled ? {
+        matrix: {
+          enabled: true,
+          homeserverUrl: input.matrix.homeserverUrl,
+          accessToken: input.matrix.accessToken,
+          userId: input.matrix.userId,
+          dmPolicy: input.matrix.dmPolicy,
+          streaming: input.matrix.streaming,
+        }
+      } : {}),
     },
     features: {
       cron: input.cronEnabled,
       heartbeat: {
         enabled: input.heartbeat.enabled,
         intervalMin: input.heartbeat.intervalMin,
+        ...(input.heartbeat.intervalMaxMin ? { intervalMaxMin: input.heartbeat.intervalMaxMin } : {}),
       },
+      ...(input.display?.showToolCalls || input.display?.showReasoning ? {
+        display: {
+          ...(input.display.showToolCalls ? { showToolCalls: true } : {}),
+          ...(input.display.showReasoning ? { showReasoning: true } : {}),
+        },
+      } : {}),
     },
     ...(input.google.enabled ? {
       integrations: {
@@ -632,6 +711,21 @@ export function applyOnboardEnvProjection(config: OnboardConfig, env: Record<str
     delete env.SIGNAL_SELF_CHAT_MODE;
     delete env.SIGNAL_DM_POLICY;
     delete env.SIGNAL_ALLOWED_USERS;
+  }
+
+  if (config.matrix?.enabled && config.matrix.accessToken) {
+    env.MATRIX_ACCESS_TOKEN = config.matrix.accessToken;
+    if (config.matrix.homeserverUrl) env.MATRIX_HOMESERVER_URL = config.matrix.homeserverUrl;
+    else delete env.MATRIX_HOMESERVER_URL;
+    if (config.matrix.userId) env.MATRIX_USER_ID = config.matrix.userId;
+    else delete env.MATRIX_USER_ID;
+    if (config.matrix.dmPolicy) env.MATRIX_DM_POLICY = config.matrix.dmPolicy;
+    else delete env.MATRIX_DM_POLICY;
+  } else {
+    delete env.MATRIX_ACCESS_TOKEN;
+    delete env.MATRIX_HOMESERVER_URL;
+    delete env.MATRIX_USER_ID;
+    delete env.MATRIX_DM_POLICY;
   }
 
   if (config.heartbeat.enabled && config.heartbeat.interval) {
@@ -1099,6 +1193,7 @@ async function stepChannels(config: OnboardConfig, env: Record<string, string>):
   if (config.discord.enabled) initialChannels.push('discord');
   if (config.whatsapp.enabled) initialChannels.push('whatsapp');
   if (config.signal.enabled) initialChannels.push('signal');
+  if (config.matrix.enabled) initialChannels.push('matrix');
   
   let channels: string[] = [];
   
@@ -1138,31 +1233,37 @@ async function stepChannels(config: OnboardConfig, env: Record<string, string>):
   config.discord.enabled = channels.includes('discord');
   config.whatsapp.enabled = channels.includes('whatsapp');
   config.signal.enabled = channels.includes('signal');
-  
+  config.matrix.enabled = channels.includes('matrix');
+
   // Configure each selected channel using shared setup functions
   if (config.telegram.enabled) {
     const result = await setupTelegram(config.telegram);
     Object.assign(config.telegram, result);
   }
-  
+
   if (config.slack.enabled) {
     const result = await setupSlack(config.slack);
     Object.assign(config.slack, result);
   }
-  
+
   if (config.discord.enabled) {
     const result = await setupDiscord(config.discord);
     Object.assign(config.discord, result);
   }
-  
+
   if (config.whatsapp.enabled) {
     const result = await setupWhatsApp(config.whatsapp);
     Object.assign(config.whatsapp, result);
   }
-  
+
   if (config.signal.enabled) {
     const result = await setupSignal(config.signal);
     Object.assign(config.signal, result);
+  }
+
+  if (config.matrix.enabled) {
+    const result = await setupMatrix(config.matrix);
+    Object.assign(config.matrix, result);
   }
 }
 
@@ -1183,19 +1284,54 @@ async function stepFeatures(config: OnboardConfig): Promise<void> {
       'Set a longer interval if you\'re watching your spend.'
     );
     const interval = await p.text({
-      message: 'Interval (minutes)',
+      message: 'Minimum interval (minutes)',
       placeholder: '240',
       initialValue: config.heartbeat.interval || '240',
     });
     if (!p.isCancel(interval)) config.heartbeat.interval = interval || '240';
+
+    const useRandom = await p.confirm({
+      message: 'Randomize heartbeat timing? (fire at random intervals within a range)',
+      initialValue: !!config.heartbeat.intervalMax,
+    });
+    if (!p.isCancel(useRandom) && useRandom) {
+      const defaultMax = config.heartbeat.intervalMax || String(Math.round(parseInt(config.heartbeat.interval || '240', 10) * 1.5));
+      const intervalMax = await p.text({
+        message: 'Maximum interval (minutes)',
+        placeholder: defaultMax,
+        initialValue: config.heartbeat.intervalMax || defaultMax,
+        validate: (v) => {
+          const max = parseInt(v, 10);
+          const min = parseInt(config.heartbeat.interval || '240', 10);
+          if (isNaN(max) || max <= 0) return 'Must be a positive number';
+          if (max <= min) return `Must be greater than the minimum interval (${min}m)`;
+        },
+      });
+      if (!p.isCancel(intervalMax)) config.heartbeat.intervalMax = intervalMax || defaultMax;
+    } else if (!p.isCancel(useRandom)) {
+      config.heartbeat.intervalMax = undefined;
+    }
   }
-  
+
   // Cron
   const setupCron = await p.confirm({
     message: 'Enable cron jobs?',
     initialValue: config.cron,
   });
   if (!p.isCancel(setupCron)) config.cron = setupCron;
+
+  // Display
+  const showToolCalls = await p.confirm({
+    message: 'Show tool calls in channel output?',
+    initialValue: config.display.showToolCalls,
+  });
+  if (!p.isCancel(showToolCalls)) config.display.showToolCalls = showToolCalls;
+
+  const showReasoning = await p.confirm({
+    message: 'Show agent thinking/reasoning in channel output?',
+    initialValue: config.display.showReasoning,
+  });
+  if (!p.isCancel(showReasoning)) config.display.showReasoning = showReasoning;
 }
 
 // ============================================================================
@@ -1581,12 +1717,20 @@ function showSummary(config: OnboardConfig): void {
   if (config.discord.enabled) channels.push('Discord');
   if (config.whatsapp.enabled) channels.push(config.whatsapp.selfChat ? 'WhatsApp (self)' : 'WhatsApp');
   if (config.signal.enabled) channels.push(config.signal.selfChat ? 'Signal (self)' : 'Signal');
+  if (config.matrix.enabled) channels.push('Matrix');
   lines.push(`Channels:  ${channels.length > 0 ? channels.join(', ') : 'None'}`);
   
   // Features
   const features: string[] = [];
-  if (config.heartbeat.enabled) features.push(`Heartbeat (${config.heartbeat.interval}m)`);
+  if (config.heartbeat.enabled) {
+    const hbLabel = config.heartbeat.intervalMax
+      ? `Heartbeat (${config.heartbeat.interval}-${config.heartbeat.intervalMax}m random)`
+      : `Heartbeat (${config.heartbeat.interval}m)`;
+    features.push(hbLabel);
+  }
   if (config.cron) features.push('Cron');
+  if (config.display.showToolCalls) features.push('Show tool calls');
+  if (config.display.showReasoning) features.push('Show reasoning');
   lines.push(`Features:  ${features.length > 0 ? features.join(', ') : 'None'}`);
   
   // Transcription
@@ -1823,18 +1967,21 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
       enabled: existingConfig.channels.telegram?.enabled || false,
       token: existingConfig.channels.telegram?.token,
       dmPolicy: existingConfig.channels.telegram?.dmPolicy,
+      streaming: existingConfig.channels.telegram?.streaming,
       allowedUsers: existingConfig.channels.telegram?.allowedUsers?.map(String),
     },
-    slack: { 
+    slack: {
       enabled: existingConfig.channels.slack?.enabled || false,
       appToken: existingConfig.channels.slack?.appToken,
       botToken: existingConfig.channels.slack?.botToken,
+      streaming: existingConfig.channels.slack?.streaming,
       allowedUsers: existingConfig.channels.slack?.allowedUsers,
     },
     discord: {
       enabled: existingConfig.channels.discord?.enabled || false,
       token: existingConfig.channels.discord?.token,
       dmPolicy: existingConfig.channels.discord?.dmPolicy,
+      streaming: existingConfig.channels.discord?.streaming,
       allowedUsers: existingConfig.channels.discord?.allowedUsers,
     },
     whatsapp: { 
@@ -1842,11 +1989,19 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
       selfChat: existingConfig.channels.whatsapp?.selfChat ?? true, // Default true
       dmPolicy: existingConfig.channels.whatsapp?.dmPolicy,
     },
-    signal: { 
+    signal: {
       enabled: existingConfig.channels.signal?.enabled || false,
       phone: existingConfig.channels.signal?.phone,
       selfChat: existingConfig.channels.signal?.selfChat ?? true, // Default true
       dmPolicy: existingConfig.channels.signal?.dmPolicy,
+    },
+    matrix: {
+      enabled: existingConfig.channels.matrix?.enabled || false,
+      homeserverUrl: existingConfig.channels.matrix?.homeserverUrl,
+      userId: existingConfig.channels.matrix?.userId,
+      accessToken: existingConfig.channels.matrix?.accessToken,
+      dmPolicy: existingConfig.channels.matrix?.dmPolicy,
+      streaming: existingConfig.channels.matrix?.streaming,
     },
     google: (() => {
       const existingAccounts = existingConfig.integrations?.google?.accounts
@@ -1863,11 +2018,16 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
         accounts: existingAccounts,
       };
     })(),
-    heartbeat: { 
+    heartbeat: {
       enabled: existingConfig.features?.heartbeat?.enabled || false,
       interval: existingConfig.features?.heartbeat?.intervalMin?.toString(),
+      intervalMax: existingConfig.features?.heartbeat?.intervalMaxMin?.toString(),
     },
     cron: existingConfig.features?.cron || false,
+    display: {
+      showToolCalls: existingConfig.features?.display?.showToolCalls || false,
+      showReasoning: existingConfig.features?.display?.showReasoning || false,
+    },
     transcription: {
       enabled: !!existingConfig.transcription?.apiKey || !!process.env.OPENAI_API_KEY || !!process.env.MISTRAL_API_KEY,
       provider: existingConfig.transcription?.provider || 'openai',
@@ -1975,8 +2135,14 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
       : '  ✗ Google Workspace',
     '',
     'Features:',
-    config.heartbeat.enabled ? `  ✓ Heartbeat (${config.heartbeat.interval}min)` : '  ✗ Heartbeat',
+    config.heartbeat.enabled
+      ? config.heartbeat.intervalMax
+        ? `  ✓ Heartbeat (${config.heartbeat.interval}-${config.heartbeat.intervalMax}min random)`
+        : `  ✓ Heartbeat (${config.heartbeat.interval}min)`
+      : '  ✗ Heartbeat',
     config.cron ? '  ✓ Cron jobs' : '  ✗ Cron jobs',
+    config.display.showToolCalls ? '  ✓ Show tool calls' : '  ✗ Show tool calls',
+    config.display.showReasoning ? '  ✓ Show reasoning' : '  ✗ Show reasoning',
     config.transcription.enabled ? `  ✓ Voice transcription (${config.transcription.provider === 'mistral' ? 'Mistral Voxtral' : 'OpenAI Whisper'})` : '  ✗ Voice transcription',
   ].join('\n');
   
